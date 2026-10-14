@@ -293,6 +293,9 @@ async def _browser_pass(
     library_http = False
     http_limiter = HostLimiter(settings.browser.interval_seconds)
     tried: list[int] = []
+    # A login page after sign-in means that publisher's session did not stick.
+    failed_auth: set[str] = set()
+    session_failed: set[int] = set()
     for index, reference, (provider, url) in queue:
         if len(silent) == 2:
             _say(
@@ -300,6 +303,18 @@ async def _browser_pass(
                 "the browser saved nothing twice in a row; finish any login or check in its window and run again",
             )
             break
+        if provider in failed_auth:
+            await _settle_browser_item(
+                library,
+                results,
+                index,
+                reference,
+                progress,
+                deferred,
+                "authentication_required",
+                f"{publisher_label(provider)} asked to sign in again, so this paper was not tried",
+            )
+            continue
         tried.append(index)
         group = auth_group(provider)
         if group not in signed_in:
@@ -351,46 +366,58 @@ async def _browser_pass(
                 limiter=http_limiter if use_http else None,
             )
             if use_http and status == "authentication_required":
-                library_http = False
-                if on_status:
-                    on_status("Library session expired; opening remaining papers in the browser.")
-                status, error, empty = await _acquire_browser_item(
-                    library,
-                    reference,
-                    ref_id,
-                    url,
-                    provider,
-                    downloads,
-                    settings,
-                    cookies=None,
-                    limiter=None,
+                # The sign-in step already happened. Opening each link and waiting
+                # out the browser timeout will not repair a session that returned a login page.
+                failed_auth.add(provider)
+                session_failed.add(index)
+                _say(
+                    on_status,
+                    f"{publisher_label(provider)} asked to sign in again; skipping its remaining papers.",
                 )
             silent = [*silent, index] if empty else []
-        key = library.get_key(reference.citation_key)
-        stem = key.filename_stem if key else reference.citation_key
-        library.ensure_alias_links(ref_id, stem)
-        library.set_status(
-            reference.citation_key,
-            status,
-            error_category=None if status in {"downloaded", "already_exists"} else status,
-            error_detail=error,
+        await _settle_browser_item(
+            library, results, index, reference, progress, deferred, status, error
         )
-        preferred = library.get_file(ref_id, "pdf")
-        results[index] = _result(
-            reference,
-            ref_id,
-            status,
-            path=_preferred_path(library, ref_id, stem),
-            provider=preferred.provider if preferred else None,
-            version=preferred.version if preferred else None,
-            error=error,
-        )
-        if status in {"downloaded", "already_exists"} or ref_id not in deferred:
-            await progress.finish(ref_id)
+    # A failed sign-in is the session, not the paper: leave those for the next run instead of taking a preprint.
+    reached = [index for index in tried if index not in session_failed]
     if len(silent) >= 2:
         # Two links in a row that saved nothing point at the window, not at those papers: try them again next run.
-        return [index for index in tried if index not in silent]
-    return tried
+        return [index for index in reached if index not in silent]
+    return reached
+
+
+async def _settle_browser_item(
+    library: Library,
+    results: list[AcquireResult],
+    index: int,
+    reference: Reference,
+    progress: _RunProgress,
+    deferred: set[str],
+    status: str,
+    error: str | None,
+) -> None:
+    ref_id = reference_id(reference)
+    key = library.get_key(reference.citation_key)
+    stem = key.filename_stem if key else reference.citation_key
+    library.ensure_alias_links(ref_id, stem)
+    library.set_status(
+        reference.citation_key,
+        status,
+        error_category=None if status in {"downloaded", "already_exists"} else status,
+        error_detail=error,
+    )
+    preferred = library.get_file(ref_id, "pdf")
+    results[index] = _result(
+        reference,
+        ref_id,
+        status,
+        path=_preferred_path(library, ref_id, stem),
+        provider=preferred.provider if preferred else None,
+        version=preferred.version if preferred else None,
+        error=error,
+    )
+    if status in {"downloaded", "already_exists"} or ref_id not in deferred:
+        await progress.finish(ref_id)
 
 
 def _ask_proxy_hosts(

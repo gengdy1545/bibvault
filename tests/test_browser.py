@@ -500,6 +500,63 @@ def test_library_papers_download_silently_with_profile_cookies(settings, respx_m
     assert locate(settings, "presto-paper")["files"]["pdf"]["source_url"] == PRESTO_URL
 
 
+def _library_cookies(monkeypatch) -> None:
+    cookies = httpx.Cookies()
+    cookies.set("session", "1", domain="libproxy.ruc.edu.cn", path="/")
+    monkeypatch.setattr(browser.BrowserDownloads, "profile_cookies", lambda self: cookies)
+
+
+def test_login_page_after_sign_in_skips_the_rest_of_that_publisher(settings, respx_mock, monkeypatch):
+    through_proxy(settings, **{"link.springer.com": SPRINGER_PROXY})
+    ieee_paper(respx_mock)
+    first_doi, second_doi = SPRINGER_DOI, "10.1007/s00778-020-00001-1"
+    first_url = f"https://{SPRINGER_PROXY}/content/pdf/{first_doi}.pdf"
+    second_url = f"https://{SPRINGER_PROXY}/content/pdf/{second_doi}.pdf"
+    preprint_a, preprint_b = "https://arxiv.org/pdf/2301.00001", "https://arxiv.org/pdf/2301.00002"
+    mock_openalex(respx_mock, first_doi, work(location(preprint_a, "submittedVersion"), is_oa=False))
+    mock_openalex(respx_mock, second_doi, work(location(preprint_b, "submittedVersion"), is_oa=False))
+    login = b"<html><body>Sign in <input type='password'></body></html>"
+    first = respx_mock.get(first_url).respond(200, content=login, headers={"content-type": "text/html"})
+    second = respx_mock.get(second_url).respond(200, content=login, headers={"content-type": "text/html"})
+    held_a = respx_mock.get(preprint_a).respond(200, content=make_pdf("preprint a"), headers=PDF)
+    held_b = respx_mock.get(preprint_b).respond(200, content=make_pdf("preprint b"), headers=PDF)
+    respx_mock.get(PRESTO_URL).respond(200, content=make_pdf(PRESTO), headers=PDF)
+    _library_cookies(monkeypatch)
+    fake = FakeBrowser()
+    text = (
+        acm("lsm-a", first_doi, LSM)
+        + acm("presto-paper", IEEE_DOI, PRESTO)
+        + acm("lsm-b", second_doi, "Another Springer Paper")
+    )
+    results = fetch(settings, refs(text), browser=True, open_url=fake)
+    assert results["lsm-a"].status == "authentication_required"
+    assert "login page" in (results["lsm-a"].error or "")
+    assert results["lsm-b"].status == "authentication_required"
+    assert "not tried" in (results["lsm-b"].error or "")
+    assert results["presto-paper"].status == "downloaded"
+    assert first.call_count == 1
+    assert second.call_count == 0
+    assert held_a.call_count == held_b.call_count == 0
+    assert fake.opened == [PORTAL]
+
+
+def test_a_missing_paper_does_not_skip_the_rest_of_that_publisher(settings, respx_mock, monkeypatch):
+    through_proxy(settings, **{"link.springer.com": SPRINGER_PROXY})
+    first_doi, second_doi = SPRINGER_DOI, "10.1007/s00778-020-00001-1"
+    first_url = f"https://{SPRINGER_PROXY}/content/pdf/{first_doi}.pdf"
+    second_url = f"https://{SPRINGER_PROXY}/content/pdf/{second_doi}.pdf"
+    second_title = "Another Springer Paper"
+    mock_openalex(respx_mock, first_doi, work(is_oa=False))
+    mock_openalex(respx_mock, second_doi, work(is_oa=False))
+    respx_mock.get(first_url).respond(404)
+    respx_mock.get(second_url).respond(200, content=make_pdf(second_title), headers=PDF)
+    _library_cookies(monkeypatch)
+    text = acm("lsm-a", first_doi, LSM) + acm("lsm-b", second_doi, second_title)
+    results = fetch(settings, refs(text), browser=True, open_url=FakeBrowser())
+    assert results["lsm-a"].status == "not_found"
+    assert results["lsm-b"].status == "downloaded"
+
+
 def test_without_an_installed_browser_statuses_stay(settings, respx_mock, launches):
     bot_checked(respx_mock)
     assert fetch(settings, refs(acm()), browser=True)["cloud-functions"].status == "manual_action_required"
