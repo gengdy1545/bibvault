@@ -71,7 +71,7 @@ This version does not log in to publishers. Each entry ends in one status:
 
 `bibvault fetch` shows one `Fetching` line for every publication in the run. A file already on disk counts immediately. Each remaining publication counts when its file is written or the run has finished with it. Sign-in prompts and other notices are printed under that line, and the line stays where it is. The report that follows counts files already on disk, newly downloaded, and only the entries it could not acquire. `--format json` lists every entry and does not show the progress line.
 
-`bibvault import FILE --key KEY --bib references.bib` accepts PDF and UTF-8 Markdown files. For an archived page, `--source-url URL` and `--provider NAME` retain its provenance in SQLite and `manifest.json`.
+`bibvault import FILE --key KEY --bib references.bib` accepts PDF, UTF-8 Markdown, and saved HTML (`.html`, `.htm`). HTML is extracted with Trafilatura and stored as Markdown. `--source-url URL` is that page's address: relative links in the extracted Markdown resolve against it, and the URL is stored with `--provider NAME` in SQLite and `manifest.json`.
 
 Web pages are fetched by Crawl4AI's HTTP strategy and their main content is extracted by Trafilatura. If that HTML has no main text, `bibvault fetch references.bib --browser` lets Crawl4AI render JavaScript in headless Chromium and runs Trafilatura again. Crawl4AI's cache is disabled, the HTML is not retained, and images remain remote links in the saved Markdown. BibVault does not enable Crawl4AI's stealth or undetected modes; a remaining bot check is `manual_action_required`.
 
