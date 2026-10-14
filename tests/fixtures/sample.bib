@@ -1,0 +1,179 @@
+% Test fixture modeled on a real systems-research bibliography.
+% Every network request made while processing it is mocked in the tests.
+
+@string{pvldb = "Proc. {VLDB} Endow."}
+
+@comment{BibTeX tools ignore comment blocks.}
+
+% ---- PDF linked directly from the entry ----
+
+@inproceedings{lakehouse-comparison23,
+    author       = {Paras Jain and
+                  Peter Kraft and
+                  Conor Power and
+                  Tathagata Das and
+                  Ion Stoica and
+                  Matei Zaharia},
+    title        = {Analyzing and Comparing Lakehouse Storage Systems},
+    booktitle    = {13th Conference on Innovative Data Systems Research ({CIDR})},
+    year         = {2023},
+    url          = {https://www.cidrdb.org/cidr2023/papers/p92-jain.pdf}
+}
+
+% ---- Open-access journal article with a DOI ----
+
+@article{delta-lake-paper,
+    author       = {Michael Armbrust and
+                  Tathagata Das and
+                  Alicja {\L}uszczak and
+                  Micha{\l} {\'S}witakowski and
+                  Herman van Hovell},
+    title        = {Delta Lake: High-Performance {ACID} Table Storage over Cloud Object Stores},
+    journal      = pvldb,
+    volume       = {13},
+    number       = {12},
+    pages        = {3411--3424},
+    year         = {2020},
+    doi          = {10.14778/3415478.3415560}
+}
+
+% The same DOI, written as a resolver URL, under a second citation key.
+@article{delta-lake-alias,
+    title        = {Delta Lake: High-Performance ACID Table Storage over Cloud Object Stores},
+    journal      = pvldb,
+    year         = {2020},
+    doi          = {https://doi.org/10.14778/3415478.3415560}
+}
+
+% ---- arXiv preprint ----
+
+@article{lance-format-preprint,
+    author       = {Weston Pace and
+                  Chang She and
+                  Lei Xu},
+    title        = {{Lance}: Efficient Random Access in Columnar Storage through Adaptive Structural Encodings},
+    journal      = {CoRR},
+    volume       = {abs/2504.15247},
+    year         = {2025},
+    doi          = {10.48550/arXiv.2504.15247},
+    url          = {https://arxiv.org/abs/2504.15247}
+}
+
+% The same preprint cited by its versioned eprint only.
+@misc{lance-eprint,
+    title        = {Lance: Efficient Random Access in Columnar Storage},
+    year         = {2025},
+    eprint       = {2504.15247v2},
+    archivePrefix = {arXiv}
+}
+
+% ---- Subscription publishers ----
+
+@inproceedings{lake-tables-short,
+    author       = {Li, Zinuo and
+                  Geng, Dongyang and
+                  Bian, Haoqiong},
+    title        = {How Consistent and Fresh are Lake Tables Really},
+    booktitle    = {Proceedings of the 1st International Workshop on Data FORMATS for Modern Architectures and Workloads},
+    publisher    = {{ACM}},
+    year         = {2026},
+    doi          = {10.1145/3802514.3812602}
+}
+
+@inproceedings{pixels-s3,
+    author       = {Haoqiong Bian and
+                  Anastasia Ailamaki},
+    title        = {Pixels: An Efficient Column Store for Cloud Data Lakes},
+    booktitle    = {38th {IEEE} International Conference on Data Engineering ({ICDE})},
+    pages        = {3078--3090},
+    publisher    = {{IEEE}},
+    year         = {2022},
+    doi          = {10.1109/ICDE53745.2022.00276}
+}
+
+@article{lsm-tree96,
+    author       = {Patrick E. O'Neil and
+                  Edward Cheng and
+                  Dieter Gawlick and
+                  Elizabeth J. O'Neil},
+    title        = {The Log-Structured Merge-Tree ({LSM}-Tree)},
+    journal      = {Acta Informatica},
+    volume       = {33},
+    number       = {4},
+    pages        = {351--385},
+    year         = {1996},
+    doi          = {10.1007/s002360050048}
+}
+
+% ---- Conference paper with only a landing-page URL ----
+
+@inproceedings{wisckey16,
+    author       = {Lanyue Lu and
+                  Thanumalayan Sankaranarayana Pillai and
+                  Andrea C. Arpaci-Dusseau and
+                  Remzi H. Arpaci-Dusseau},
+    title        = {{WiscKey}: Separating Keys from Values in {SSD}-conscious Storage},
+    booktitle    = {14th {USENIX} Conference on File and Storage Technologies ({FAST})},
+    publisher    = {{USENIX} Association},
+    year         = {2016},
+    url          = {https://www.usenix.org/conference/fast16/technical-sessions/presentation/lu}
+}
+
+% ---- Title only: no DOI and no URL ----
+
+@inproceedings{lakehouse,
+    author       = {Michael Armbrust and
+                  Ali Ghodsi and
+                  Reynold Xin and
+                  Matei Zaharia},
+    title        = {Lakehouse: {A} New Generation of Open Platforms that Unify Data Warehousing and Advanced Analytics},
+    booktitle    = {11th Conference on Innovative Data Systems Research ({CIDR})},
+    year         = {2021}
+}
+
+% ---- Web resources ----
+
+@online{hudi-index,
+    author       = {{Apache Software Foundation}},
+    title        = {{Apache Hudi} - Indexes},
+    year         = {n.d.},
+    url          = {https://hudi.apache.org/docs/indexes/},
+    lastaccessed = {October 9, 2026}
+}
+
+@online{rocksdb-checkpoints,
+    author       = {{Meta Platforms}},
+    title        = {{RocksDB} Checkpoints},
+    year         = {2026},
+    url          = {https://github.com/facebook/rocksdb/wiki/Checkpoints},
+    lastaccessed = {August 19, 2026}
+}
+
+@misc{pixels-retina,
+    title        = {Pixels Retina},
+    year         = {2026},
+    url          = {https://github.com/pixelsdb/pixels/tree/master/pixels-retina}
+}
+
+% A web entry that links straight to a PDF.
+@online{table-format-whitepaper,
+    author       = {{Example Project}},
+    title        = {Table Format Whitepaper},
+    year         = {2024},
+    url          = {https://docs.example.org/whitepaper.pdf}
+}
+
+% ---- crossref inheritance ----
+
+@proceedings{cidr2021,
+    title        = {11th Conference on Innovative Data Systems Research},
+    booktitle    = {11th Conference on Innovative Data Systems Research ({CIDR})},
+    year         = {2021},
+    publisher    = {www.cidrdb.org}
+}
+
+@inproceedings{crossref-child,
+    author       = {Jane Doe},
+    title        = {A Paper That Inherits Its Venue},
+    crossref     = {cidr2021}
+}
