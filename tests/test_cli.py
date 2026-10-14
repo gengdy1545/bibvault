@@ -257,4 +257,4 @@ def test_import_rejects_other_file_types(config, project):
     bib.write_text("@online{paper, title={Paper}, url={https://example.org}}", encoding="utf-8")
     result = cli(config, "import", str(text), "--key", "paper", "--bib", str(bib))
     assert result.exit_code == 1
-    assert "expected .pdf or .md" in result.output
+    assert "expected .pdf, .html, or .md" in result.output

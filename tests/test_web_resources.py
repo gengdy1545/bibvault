@@ -393,6 +393,83 @@ def test_cli_locates_an_archived_page(project, respx_mock):
     assert "papers/hudi-index.md" in located.output
 
 
+def saved_article(title: str = "HeatWave") -> str:
+    # Long enough that Trafilatura keeps the article instead of falling back to the whole page.
+    paragraph = f"{title} stores analytic data in memory and answers SQL without a separate warehouse. "
+    return (
+        "<!DOCTYPE html><html><head>"
+        f"<title>{title}</title></head><body>"
+        "<nav>Home Docs Blog</nav><article>"
+        f"<h1>{title}</h1><p>{paragraph * 4}See <a href=\"/docs/start\">the guide</a>.</p>"
+        '<img src="images/figure.png" alt="figure">'
+        "</article><footer>Copyright 2026</footer></body></html>"
+    )
+
+
+def test_cli_imports_saved_html_as_markdown(project):
+    url = "https://dzone.com/articles/heatwave"
+    config = write_config(project)
+    bib = project / "refs.bib"
+    bib.write_text(f"@online{{heatwave, title = {{HeatWave}}, url = {{{url}}}}}", encoding="utf-8")
+    saved = project / "Downloads" / "heatwave.html"
+    saved.parent.mkdir()
+    saved.write_text(saved_article(), encoding="utf-8")
+
+    imported = cli(
+        config,
+        "import",
+        str(saved),
+        "--key",
+        "heatwave",
+        "--bib",
+        str(bib),
+        "--source-url",
+        url,
+    )
+    assert imported.exit_code == 0, imported.output
+    assert "papers/heatwave.md" in imported.output
+    body = (project / "papers" / "heatwave.md").read_text(encoding="utf-8")
+    assert "stores analytic data in memory" in body
+    assert "[the guide](https://dzone.com/docs/start)" in body
+    assert "![figure](https://dzone.com/articles/images/figure.png)" in body
+    assert "Home Docs Blog" not in body
+    assert "Copyright 2026" not in body
+
+    payload = locate(make_settings(project), "heatwave")
+    assert payload["version"] == "provided"
+    assert payload["files"]["markdown"]["provider"] == "trafilatura"
+    assert payload["files"]["markdown"]["source_url"] == url
+
+    again = cli(config, "import", str(saved), "--key", "heatwave", "--bib", str(bib), "--source-url", url)
+    assert again.exit_code == 0, again.output
+    assert "already_exists" in again.output
+
+
+def test_saved_html_without_a_source_url_keeps_relative_links(project):
+    config = write_config(project)
+    bib = project / "refs.bib"
+    bib.write_text("@online{heatwave, title = {HeatWave}, url = {https://dzone.com/articles/heatwave}}", encoding="utf-8")
+    saved = project / "heatwave.htm"
+    saved.write_text(saved_article(), encoding="utf-8")
+    imported = cli(config, "import", str(saved), "--key", "heatwave", "--bib", str(bib))
+    assert imported.exit_code == 0, imported.output
+    body = (project / "papers" / "heatwave.md").read_text(encoding="utf-8")
+    assert "[the guide](/docs/start)" in body
+    assert "![figure](images/figure.png)" in body
+
+
+def test_saved_html_without_main_text_is_rejected(project):
+    config = write_config(project)
+    bib = project / "refs.bib"
+    bib.write_text("@online{empty, title = {Empty}, url = {https://example.org/empty}}", encoding="utf-8")
+    saved = project / "empty.html"
+    saved.write_text("<html><body></body></html>", encoding="utf-8")
+    result = cli(config, "import", str(saved), "--key", "empty", "--bib", str(bib))
+    assert result.exit_code == 1
+    assert "no main text" in result.output
+    assert not (project / "papers" / "empty.md").exists()
+
+
 def test_cli_imports_markdown_with_provenance(project, respx_mock):
     url = "https://dzone.com/articles/an-in-depth-look-at-oracle-mysql-heatwave"
     config = write_config(project)

@@ -227,13 +227,17 @@ def verify(
 @app.command("import")
 def import_content(
     ctx: typer.Context,
-    file: Path = typer.Argument(..., help="PDF or Markdown file to import"),
+    file: Path = typer.Argument(..., help="PDF, HTML, or Markdown file to import"),
     key: str = typer.Option(..., "--key", help="Citation key that should own this file"),
     bib: Path | None = typer.Option(None, "--bib", help="BibTeX file used to resolve the key"),
     source_url: str | None = typer.Option(None, "--source-url", help="Original URL for provenance"),
     provider: str = typer.Option("import", "--provider", help="Provider recorded in the manifest"),
 ) -> None:
-    """Associate a local PDF or Markdown file with a citation key."""
+    """Associate a local PDF, HTML, or Markdown file with a citation key.
+
+    An HTML file is extracted with Trafilatura and stored as Markdown.
+    ``--source-url`` is the page address used to resolve relative links.
+    """
 
     if not file.is_file():
         raise typer.BadParameter(f"file not found: {file}")

@@ -34,7 +34,7 @@ from bibvault.models import AcquireResult, Reference
 from bibvault.network import HostLimiter, fetch_valid_pdf, guard_request, make_client
 from bibvault.pdfcheck import assert_pdf_file
 from bibvault.resolve import Resolution, is_pdf_url, resolve_candidates
-from bibvault.storage import Library, sha256_file
+from bibvault.storage import Library, sha256_bytes, sha256_file
 from bibvault.web import WebPageFetcher, html_to_markdown
 
 logger = logging.getLogger(__name__)
@@ -683,6 +683,7 @@ def import_file(
     provider: str = "import",
 ) -> AcquireResult:
     suffix = file_path.suffix.lower()
+    payload: bytes | None = None
     if suffix == ".pdf":
         role = "pdf"
         assert_pdf_file(file_path)
@@ -694,10 +695,20 @@ def import_file(
             raise BibVaultError(f"{file_path} is not UTF-8 Markdown") from exc
         if not text.strip():
             raise BibVaultError(f"{file_path} is empty")
+    elif suffix in {".html", ".htm"}:
+        role = "markdown"
+        markdown = html_to_markdown(file_path.read_bytes(), source_url or "")
+        if markdown is None:
+            raise BibVaultError(f"no main text extracted from {file_path}")
+        payload = markdown.encode("utf-8")
+        if provider == "import":
+            provider = "trafilatura"
     else:
-        raise BibVaultError(f"cannot import {file_path.suffix or 'a file without an extension'}; expected .pdf or .md")
+        raise BibVaultError(
+            f"cannot import {file_path.suffix or 'a file without an extension'}; expected .pdf, .html, or .md"
+        )
 
-    incoming = sha256_file(file_path)
+    incoming = sha256_bytes(payload) if payload is not None else sha256_file(file_path)
     ref_id = ref_id or reference_id(reference)
     library.upsert_publication(reference, ref_id)
     current = library.get_key(reference.citation_key)
@@ -733,7 +744,7 @@ def import_file(
         stem=stem,
         role=role,
         version="provided",
-        data=file_path.read_bytes(),
+        data=payload if payload is not None else file_path.read_bytes(),
         source_url=source_url,
         provider=provider,
     )
