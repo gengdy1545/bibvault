@@ -1,7 +1,11 @@
 from pathlib import Path
 
+import pytest
+from typer.testing import CliRunner
+
 from bibvault import config
-from bibvault.config import DEFAULT_CONFIG, load_settings
+from bibvault.cli import app
+from bibvault.config import DEFAULT_CONFIG, ConfigError, load_settings
 
 
 def write(path: Path, text: str) -> Path:
@@ -42,6 +46,26 @@ def test_explicit_config_path(tmp_path):
     settings = load_settings(start=tmp_path, config_path=path)
     assert settings.download.concurrency == 9
     assert settings.project_root == (tmp_path / "elsewhere").resolve()
+
+
+def test_missing_explicit_config_path_is_an_error(tmp_path):
+    path = tmp_path / "missing.toml"
+    with pytest.raises(ConfigError, match=str(path)):
+        load_settings(start=tmp_path, config_path=path)
+
+
+def test_cli_reports_config_path_errors_as_usage_errors(tmp_path):
+    path = tmp_path / "missing.toml"
+    result = CliRunner().invoke(app, ["--config", str(path), "version"])
+    assert result.exit_code == 2
+    assert "configuration file not found" in result.output
+    assert path.name in result.output
+
+
+def test_malformed_config_error_names_its_path(tmp_path):
+    path = write(tmp_path / ".bibvault" / "config.toml", "[download\nconcurrency = 4\n")
+    with pytest.raises(ConfigError, match=str(path)):
+        load_settings(start=tmp_path)
 
 
 def test_config_outside_a_bibvault_directory_uses_its_own_directory(tmp_path):
@@ -85,9 +109,76 @@ def test_unknown_keys_are_ignored(tmp_path):
     assert settings.library.root == "./papers"
 
 
+@pytest.mark.parametrize(
+    ("section", "field", "value"),
+    [
+        ("download", "concurrency", "0"),
+        ("download", "timeout_seconds", "0"),
+        ("download", "timeout_seconds", "inf"),
+        ("download", "max_retries", "-1"),
+        ("download", "max_bytes", "0"),
+        ("download", "min_interval_seconds", "-0.1"),
+        ("download", "min_interval_seconds", "nan"),
+        ("resolution", "title_match_threshold", "1.1"),
+        ("resolution", "title_match_threshold", "nan"),
+        ("browser", "interval_seconds", "-1"),
+        ("browser", "max_per_run", "-1"),
+        ("browser", "timeout_seconds", "0"),
+        ("browser", "timeout_seconds", "inf"),
+    ],
+)
+def test_invalid_numeric_config_names_field_and_path(tmp_path, section, field, value):
+    path = write(
+        tmp_path / ".bibvault" / "config.toml",
+        f"[{section}]\n{field} = {value}\n",
+    )
+    with pytest.raises(ConfigError) as raised:
+        load_settings(start=tmp_path)
+    assert str(path) in str(raised.value)
+    assert f"{section}.{field}" in str(raised.value)
+
+
+def test_legacy_unwired_defaults_remain_compatible(tmp_path):
+    write(
+        tmp_path / ".bibvault" / "config.toml",
+        """
+[library]
+mode = "project"
+naming = "citation_key"
+layout = "flat"
+verify_checksums = true
+[download]
+skip_existing = true
+""",
+    )
+    settings = load_settings(start=tmp_path)
+    assert settings.library.mode == "project"
+    assert settings.download.skip_existing is True
+
+
+@pytest.mark.parametrize(
+    ("text", "field"),
+    [
+        ('[library]\nnaming = "title"\n', "library.naming"),
+        ("[library]\nverify_checksums = false\n", "library.verify_checksums"),
+        ("[download]\nskip_existing = false\n", "download.skip_existing"),
+    ],
+)
+def test_unimplemented_legacy_options_remain_compatible_but_warn(
+    tmp_path, caplog, text, field
+):
+    path = write(tmp_path / ".bibvault" / "config.toml", text)
+    load_settings(start=tmp_path)
+    assert str(path) in caplog.text
+    assert field in caplog.text
+    assert "not implemented and is ignored" in caplog.text
+
+
 def test_default_config_round_trips(tmp_path):
     write(tmp_path / ".bibvault" / "config.toml", DEFAULT_CONFIG)
     settings = load_settings(start=tmp_path)
     assert settings.library.naming == "citation_key"
     assert settings.download.concurrency == 4
     assert settings.resolution.email == ""
+    for unwired in ("mode =", "naming =", "layout =", "verify_checksums =", "skip_existing ="):
+        assert unwired not in DEFAULT_CONFIG

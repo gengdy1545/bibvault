@@ -3,6 +3,8 @@ import pytest
 from bibvault.identity import (
     doi_from_url,
     extract_arxiv_id,
+    internal_identity_warning,
+    legacy_internal_id,
     normalize_doi,
     normalize_url,
     reference_id,
@@ -101,6 +103,29 @@ def test_internal_identity_is_stable_and_independent_of_the_key():
     assert reference_id(one) == reference_id(two)
     assert reference_id(one).startswith("internal:")
     assert reference_id(one) != reference_id(other)
+
+
+def test_internal_identity_preserves_unicode_letters_and_numbers():
+    one = ref(title="湖仓一体架构", year="２０２４", authors=["张三"])
+    same = ref(title="湖仓一体架构", year="2024", authors=["张三"])
+    other = ref(title="数据密集型系统", year="2024", authors=["张三"])
+    assert reference_id(one) == reference_id(same)
+    assert reference_id(one) != reference_id(other)
+    assert reference_id(one) != legacy_internal_id(one)
+
+
+def test_internal_identity_normalizes_equivalent_unicode():
+    composed = ref(title="Café 数据", year="2024", authors=["Zoë"])
+    decomposed = ref(title="Cafe\u0301 数据", year="2024", authors=["Zoe\u0308"])
+    assert reference_id(composed) == reference_id(decomposed)
+
+
+def test_low_information_internal_identity_has_a_collision_warning():
+    warning = internal_identity_warning(ref(year="2024"))
+    assert warning is not None
+    assert "may collide" in warning
+    assert internal_identity_warning(ref(title="A useful title", year="2024")) is None
+    assert internal_identity_warning(ref(doi="10.1000/x")) is None
 
 
 def test_identity_is_never_the_citation_key():

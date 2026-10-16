@@ -20,14 +20,19 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
+    "mcp>=1.8",
     "mypy>=1.10",
     "pytest>=8",
     "respx>=0.21",
     "ruff>=0.6",
 ]
+mcp = [
+    "mcp>=1.8",
+]
 
 [project.scripts]
 bibvault = "bibvault.cli:app"
+bibvault-mcp = "bibvault.mcp_server:main"
 
 [build-system]
 requires = ["hatchling"]
@@ -39,9 +44,18 @@ packages = ["src/bibvault"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 markers = [
+    "browser: launches an installed interactive browser; opt in explicitly",
     "crawl4ai: exercises the Crawl4AI adapter instead of the test HTTP shim",
     "live: hits the real network; runs only with BIBVAULT_LIVE_TESTS=1",
 ]
+
+[tool.coverage.run]
+branch = true
+source = ["bibvault"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
 
 [tool.mypy]
 python_version = "3.11"
@@ -50,7 +64,7 @@ check_untyped_defs = true
 plugins = ["pydantic.mypy"]
 
 [[tool.mypy.overrides]]
-module = ["bibtexparser.*", "crawl4ai.*", "pymupdf.*", "trafilatura.*"]
+module = ["bibtexparser.*", "crawl4ai.*", "pymupdf", "pymupdf.*", "trafilatura.*"]
 ignore_missing_imports = true
 
 [tool.ruff]
@@ -60,3 +74,4 @@ target-version = "py311"
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP"]
 ignore = ["E501"]
+

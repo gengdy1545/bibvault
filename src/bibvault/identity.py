@@ -7,6 +7,7 @@ internal id for records that have no external identifier.
 
 import hashlib
 import re
+import unicodedata
 from urllib.parse import unquote, urlsplit, urlunsplit
 
 from bibvault.models import Reference
@@ -66,6 +67,28 @@ def reference_id(reference: Reference) -> str:
     return f"internal:{_digest(_fingerprint(reference))}"
 
 
+def legacy_internal_id(reference: Reference) -> str:
+    """Return the internal id produced before Unicode fingerprints."""
+
+    return f"internal:{_digest(_fingerprint(reference, legacy=True))}"
+
+
+def internal_identity_warning(reference: Reference) -> str | None:
+    """Explain when an internal id lacks enough metadata to be safely distinctive."""
+
+    if reference.doi or reference.arxiv_id or reference.url:
+        return None
+    title = _tokens(reference.title)
+    year = _tokens(reference.year)
+    authors = _tokens(" ".join(reference.authors))
+    if title and (year or authors):
+        return None
+    return (
+        f"citation key '{reference.citation_key}' has a low-information internal identity "
+        "that may collide; add a title plus year or author, or an external identifier"
+    )
+
+
 def normalize_url(url: str) -> str:
     parts = urlsplit(url.strip())
     host = (parts.hostname or "").lower()
@@ -76,14 +99,34 @@ def normalize_url(url: str) -> str:
     return urlunsplit((parts.scheme.lower(), netloc, path, parts.query, ""))
 
 
-def _fingerprint(reference: Reference) -> str:
-    title = _tokens(reference.title)
-    year = (reference.year or "").strip().lower()
-    authors = _tokens(" ".join(reference.authors))
+def _fingerprint(reference: Reference, *, legacy: bool = False) -> str:
+    tokenize = _legacy_tokens if legacy else _tokens
+    title = tokenize(reference.title)
+    year = (
+        (reference.year or "").strip().lower()
+        if legacy
+        else tokenize(reference.year)
+    )
+    authors = tokenize(" ".join(reference.authors))
     return f"{title}|{year}|{authors}"
 
 
 def _tokens(value: str | None) -> str:
+    normalized = unicodedata.normalize("NFKC", value or "").casefold()
+    tokens: list[str] = []
+    current: list[str] = []
+    for character in normalized:
+        if unicodedata.category(character)[0] in {"L", "M", "N"}:
+            current.append(character)
+        elif current:
+            tokens.append("".join(current))
+            current = []
+    if current:
+        tokens.append("".join(current))
+    return " ".join(tokens)
+
+
+def _legacy_tokens(value: str | None) -> str:
     return " ".join(re.findall(r"[a-z0-9]+", (value or "").lower()))
 
 

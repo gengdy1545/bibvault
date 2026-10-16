@@ -64,6 +64,7 @@ def parse_bibtex(text: str, source: str | None = None) -> tuple[list[Reference],
                 publisher=_field(record, "publisher"),
                 venue=_field(record, "journal") or _field(record, "booktitle"),
                 volume=_field(record, "volume"),
+                number=_field(record, "number") or _field(record, "issue"),
                 pages=_field(record, "pages"),
                 source=source,
             )

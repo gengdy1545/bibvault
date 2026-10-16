@@ -44,7 +44,7 @@ def test_ascii_progress_fills_the_bar():
 
 def test_progress_line_stays_above_later_messages():
     stream = StringIO()
-    display = FetchDisplay(stream)
+    display = FetchDisplay(stream, tty=True)
     display.progress(1, 4, "Fetching")
     display.status("Press Enter when sign-in (or the bot check) is done.")
     display.progress(2, 4, "Fetching")
@@ -54,3 +54,18 @@ def test_progress_line_stays_above_later_messages():
     assert f"\033[{display.lines_below + 1}A" in text
     assert "Fetching [##########----------] 2/4" in text
     assert text.index("Press Enter") < text.index("\033[")
+
+
+def test_progress_on_a_pipe_has_no_ansi():
+    stream = StringIO()
+    display = FetchDisplay(stream, tty=False)
+    display.progress(1, 2, "Fetching")
+    display.status("warning: low-information identity")
+    display.progress(2, 2, "Fetching")
+    text = stream.getvalue()
+    assert "\033" not in text
+    assert text == (
+        "Fetching [##########----------] 1/2\n"
+        "warning: low-information identity\n"
+        "Fetching [####################] 2/2\n"
+    )

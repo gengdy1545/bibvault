@@ -6,40 +6,85 @@ BibVault turns a BibTeX file into a local library that LaTeX and AI agents can a
 BibTeX citation key → reference metadata → local PDF → SQLite / manifest.json
 ```
 
-V0.1 downloads open-access PDFs and archives web pages as Markdown. The preferred file is `{citation_key}.pdf` for a paper and `{citation_key}.md` for a web page. Publisher login and MCP are later phases.
+V0.1 downloads open-access PDFs and archives web pages as Markdown. The preferred file is `{citation_key}.pdf` for a paper and `{citation_key}.md` for a web page. The optional local MCP server is `bibvault-mcp` from the `mcp` extra. AI clients follow [docs/AI_USAGE.md](docs/AI_USAGE.md).
 
-## Install
+BibVault does not collect publisher credentials or bypass access controls. With `fetch --browser`, it can hand publisher links to a separate Chromium-family browser where you sign in yourself, then reuse that browser's library-proxy session when possible.
+
+## Install for use
 
 Requires Python 3.11+.
 
+From a source checkout, install the CLI in an isolated uv tool environment:
+
+```bash
+uv tool install . --with-executables-from crawl4ai
+bibvault --help
+```
+
+This does not install test, lint, or type-checking dependencies. To include the local MCP server, use `uv tool install ".[mcp]" --with-executables-from crawl4ai`. A browser is optional:
+
+- Direct PDF links, ordinary web pages, arXiv, and publisher sites that serve files over HTTP need no browser.
+- For JavaScript-only web pages, run `crawl4ai-setup` once. It installs the headless Chromium used by Crawl4AI.
+- For ACM downloads or IEEE/Springer through a library proxy, install Edge, Chrome, Chromium, or Brave. This is a separate visible browser where you complete sign-in yourself. Set `executable` under `[browser]` if BibVault cannot find it.
+
+For development instead:
+
 ```bash
 uv sync --extra dev
-uv run crawl4ai-setup       # once; installs Chromium for dynamic web pages
 uv run bibvault --help
+uv run pytest
 ```
+
+Development commands use `uv run bibvault`; the remaining examples use the isolated `bibvault` command.
 
 ## Quick start
 
+Initialize a project and run the local, no-network readiness checks:
+
 ```bash
-uv run bibvault init
-uv run bibvault auth login openalex    # once per machine; see "OpenAlex API key" below
-uv run bibvault fetch references.bib --key lakehouse-comparison23
-uv run bibvault locate lakehouse-comparison23
-uv run bibvault locate lakehouse-comparison23 --format json
-uv run bibvault verify --references
-uv run bibvault sync references.bib
+bibvault init
+bibvault doctor
 ```
+
+The smallest acquisition path needs neither OpenAlex nor Chromium. Put a direct PDF URL in `references.bib`:
+
+```bibtex
+@article{attention2017,
+  title = {Attention Is All You Need},
+  year = {2017},
+  url = {https://arxiv.org/pdf/1706.03762.pdf}
+}
+```
+
+Then fetch and locate it:
+
+```bash
+bibvault fetch references.bib --key attention2017
+bibvault locate attention2017
+bibvault verify --references
+```
+
+Use `bibvault sync references.bib` when the BibTeX file is the complete set you want reconciled and fetched.
+
+## Command boundaries
+
+- `fetch BIB...` reconciles the supplied entries and acquires all missing files, or only the requested `--key` values. `fetch --upgrade --key KEY` downloads a replacement and atomically replaces the stored PDF only when that version ranks higher. A failed download, or a file whose bytes no longer match the stored checksum, leaves the original in place.
+- `sync BIB...` reconciles the complete supplied BibTeX set, including citation-key renames, then acquires missing files. `sync --browser` uses the same browser pass as `fetch --browser`. Omitted standalone entries stay unless `--prune-keys` is set; that releases their citation keys and moves PDF bytes to `papers/_unreferenced/` without deleting them. `--prune-keys --dry-run` only lists those keys.
+- `fetch --browser` first uses the normal HTTP paths. It additionally renders JavaScript-only web pages in Crawl4AI's headless Chromium and, for supported publishers, opens links in a separate visible browser. Human sign-in stays in that browser; BibVault never receives the password.
+- `status` lists the library. `status BIB...` counts entries that are available locally, known but missing a file, not in the library, or left in the library.
+- `find --doi DOI` and `find --title TEXT` search stored metadata and make no network requests. `sources` lists registered database sources and whether each one needs a browser.
+- `import FILE --key KEY` performs no discovery or download. It validates a PDF, Markdown, or saved HTML file and registers it under an existing key; pass `--bib` when the key has not been synced yet.
 
 ## OpenAlex API key
 
-BibVault finds open-access copies through the OpenAlex API. Set up a free key before the first `fetch`:
+BibVault uses OpenAlex to discover open-access copies when a direct or supported publisher source is not already known. A key is recommended, but it is not required for the direct-PDF path above, arXiv identifiers, or supported publisher sources. To enable full DOI and title discovery:
 
 1. Create an account at [openalex.org](https://openalex.org) (about 30 seconds).
 2. Copy your key from [openalex.org/settings/api](https://openalex.org/settings/api).
-3. Run `uv run bibvault auth login openalex` and paste it. The input is not shown, the key is checked with OpenAlex, and it is saved to `~/.config/bibvault/credentials.toml`, readable only by you. Nothing goes into the project.
-4. Run `uv run bibvault auth status` to confirm. It prints only the last four characters of the key.
+3. Run `bibvault auth login openalex` and paste it. The input is not shown, the key is checked with OpenAlex, and it is saved to `~/.config/bibvault/credentials.toml`, readable only by you. Nothing goes into the project.
+4. Run `bibvault auth status` to confirm. It prints only the last four characters of the key.
 
-`uv run bibvault auth logout openalex` deletes the saved key. For scripts and CI, `BIBVAULT_OPENALEX_API_KEY` works too and overrides the saved key. The key is also your openalex.org login: never put it in a project config you commit, and if it leaks, rotate it under Settings → API key.
+`bibvault auth logout openalex` deletes the saved key. For scripts and CI, `BIBVAULT_OPENALEX_API_KEY` works too and overrides the saved key. The key is also your openalex.org login: never put it in a project config you commit, and if it leaks, rotate it under Settings → API key.
 
 Without a key, OpenAlex gives your IP address a small daily budget, and your own visits to openalex.org draw on the same budget. When it runs out, the website shows a "Looks like you're a bot" page until midnight UTC. So without a key BibVault holds back:
 
@@ -47,6 +92,20 @@ Without a key, OpenAlex gives your IP address a small daily budget, and your own
 - No title searches, which cost ten lookups each. Entries without a DOI end as `rate_limited` until you add a key.
 
 With or without a key, an answer that OpenAlex's budget is spent (HTTP 429) ends OpenAlex requests for the run and until the budget refills, instead of being retried for every entry. A key that OpenAlex rejects (HTTP 401) ends them for the run. A title search, found or not, is reused for seven days. Publisher sites, arXiv, direct PDF links, and `--browser` keep working when OpenAlex is off. To not use OpenAlex at all, set `use_openalex = false` under `[resolution]`.
+
+## Configuration and doctor
+
+Configuration is merged in this order, from lowest to highest precedence:
+
+1. Built-in defaults.
+2. `~/.config/bibvault/config.toml`.
+3. `~/.config/bibvault/credentials.toml`, written by `auth login`.
+4. The nearest project `.bibvault/config.toml`, or the file selected by `--config PATH`.
+5. `BIBVAULT_EMAIL`, `BIBVAULT_OPENALEX_API_KEY`, and `BIBVAULT_LIBRARY_ROOT`.
+
+`--config` selects the project-config layer; environment variables still win. A relative `library.root` is resolved from the project root associated with that config.
+
+`bibvault doctor` is deliberately local: it reports the Python version, effective project-config path, library-directory writability, OpenAlex key presence, and a detected visible Chromium-family browser. It neither validates the key over the network nor launches a browser or downloads a paper. A missing OpenAlex key or browser is a warning because the minimal direct-PDF path does not need either. An unsupported Python or unusable library directory makes `doctor` exit with status 1.
 
 Some publishers serve their papers openly, so BibVault gets those from the publisher's own site and does not use the OpenAlex budget:
 
@@ -58,7 +117,7 @@ Some publishers serve their papers openly, so BibVault gets those from the publi
 
 ## Statuses
 
-This version does not log in to publishers. Each entry ends in one status:
+BibVault does not perform publisher login itself. When `fetch --browser` is used, you may sign in in the separate visible browser described below. Each entry ends in one status:
 
 - `downloaded` / `already_exists`: the PDF or the archived Markdown page is in `papers/`.
 - `no_open_access_found`: OpenAlex knows the paper but lists no open-access copy. It may still be free somewhere else, or need your library's access. Download it yourself, then run `bibvault import paper.pdf --key KEY`.
@@ -69,7 +128,11 @@ This version does not log in to publishers. Each entry ends in one status:
 - `rate_limited`: OpenAlex's daily budget, or BibVault's own limit for requests without a key, is used up, or the entry needs a title search and there is no key. The message says which; adding a key or waiting for midnight UTC fixes it.
 - `failed`: try again later; `fetch` exits with code 1 when anything failed.
 
-`bibvault fetch` shows one `Fetching` line for every publication in the run. A file already on disk counts immediately. Each remaining publication counts when its file is written or the run has finished with it. Sign-in prompts and other notices are printed under that line, and the line stays where it is. The report that follows counts files already on disk, newly downloaded, and only the entries it could not acquire. `--format json` lists every entry and does not show the progress line.
+`bibvault fetch` shows one `Fetching` line for every publication in the run. A file already on disk counts immediately. Each remaining publication counts when its file is written or the run has finished with it. Sign-in prompts and other notices are printed under that line, and the line stays where it is. On a terminal the progress line is rewritten with ANSI cursor motion. When stderr is not a terminal, progress and warnings are plain lines on stderr, in order. The report that follows counts files already on disk, newly downloaded, and only the entries it could not acquire. `--format json` lists every entry and does not show the progress line.
+
+`locate`, `status`, and `fetch --format json` share one record shape: `schema_version`, `citation_key`, `availability` (`available`, `missing`, or `unknown`), `status`, `error`, and `error_category`. `locate` exits 0 when a file is present, 1 when the key is known but the file is missing, and 2 when the key is unknown. `fetch` still exits 2 for a key that is not in the BibTeX file and 1 when a download fails. `status` is informational and exits 0.
+
+`manifest.json` is rewritten from SQLite. Version 1 is `{"manifest_version": 1, "references": {citation key: record}}`. Readers also accept the older unversioned map. A newer `manifest_version` is rejected; SQLite remains the source of truth, and the next command rewrites the manifest from it.
 
 `bibvault import FILE --key KEY --bib references.bib` accepts PDF, UTF-8 Markdown, and saved HTML (`.html`, `.htm`). HTML is extracted with Trafilatura and stored as Markdown. `--source-url URL` is that page's address: relative links in the extracted Markdown resolve against it, and the URL is stored with `--provider NAME` in SQLite and `manifest.json`.
 
@@ -101,6 +164,12 @@ A PDF you annotated in place is kept; `verify` reports that its checksum changed
 
 Downloaded files go to `papers/` and are ignored by git. Mapping state lives in `.bibvault/index.sqlite`. `manifest.json` is regenerated from that database.
 
+## Backups
+
+After any running BibVault command has exited, back up both the effective library root (`papers/` by default, including `_unreferenced/`) and the project's `.bibvault/` directory. The PDF/Markdown files contain the acquired or annotated bytes; `index.sqlite` is the source of truth for citation-key mappings, checksums, and provenance; `config.toml` records project settings. `manifest.json` is useful but can be regenerated and is not a database backup.
+
+User-level files are separate. Back up `~/.config/bibvault/config.toml` if you need its proxy/browser settings. Treat `credentials.toml` as a secret and copy it only through a secure backup; it is not required to restore the library contents. The browser profile under `~/.config/bibvault/browser/` contains replaceable session state and is not part of the project backup.
+
 ## Layout
 
 ```
@@ -115,7 +184,7 @@ papers/
 └── manifest.json
 ```
 
-`papers/iceberg2020.pdf` is the full text of a paper. `papers/hudi-index.md` is the archived text of a web page, with the page's own image URLs left in the Markdown. BibVault keeps one PDF per paper: the best version it can download, with a PDF link in the entry itself first, then the published version, then an accepted manuscript, then a preprint. A paper that already has its PDF makes no requests on later runs, so a preprint is never followed by a second download of the published version. To replace a file with a better version, delete it and fetch again. Two citation keys for the same DOI share one publication id and, when the filesystem allows, one set of bytes via a hard link.
+`papers/iceberg2020.pdf` is the full text of a paper. `papers/hudi-index.md` is the archived text of a web page, with the page's own image URLs left in the Markdown. BibVault keeps one PDF per paper: the best version it can download, with a PDF link in the entry itself first, then the published version, then an accepted manuscript, then a preprint. A paper that already has its PDF makes no requests on later runs, so a preprint is never followed by a second download of the published version. To replace it with a higher-ranked version, run `bibvault fetch references.bib --upgrade --key KEY`. Two citation keys for the same DOI share one publication id and, when the filesystem allows, one set of bytes via a hard link.
 
 Filenames keep letters and digits of any script, so `张三2020` becomes `张三2020.pdf`; characters such as `: / \ * ?` become `_`.
 

@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from bibvault.storage import load_manifest
 from tests.helpers import (
     cli,
     fetch,
@@ -90,7 +91,9 @@ def test_manifest_lists_every_key(offline, pdfs, respx_mock):
         "gone", doi=DOI_Y, url="https://oa.example/gone.pdf", title="Gone"
     )
     fetch(offline, refs(text))
-    manifest = json.loads(offline.manifest_path.read_text(encoding="utf-8"))
+    raw = json.loads(offline.manifest_path.read_text(encoding="utf-8"))
+    assert raw["manifest_version"] == 1
+    manifest = load_manifest(offline.manifest_path)
     assert set(manifest) == {"paper", "gone"}
     assert manifest["paper"] == {
         "reference_id": f"doi:{DOI_X}",
@@ -119,7 +122,7 @@ def test_manifest_is_regenerated_from_sqlite(offline, pdfs):
     fetch(offline, refs(article("paper", doi=DOI_X, url=URL_X)))
     offline.manifest_path.write_text("{ hand edited and broken", encoding="utf-8")
     fetch(offline, refs(article("paper", doi=DOI_X, url=URL_X)))
-    manifest = json.loads(offline.manifest_path.read_text(encoding="utf-8"))
+    manifest = load_manifest(offline.manifest_path)
     assert manifest["paper"]["files"]["pdf"] == "papers/paper.pdf"
     assert not offline.manifest_path.with_suffix(".json.partial").exists()
 
@@ -357,7 +360,7 @@ def test_chinese_keys_get_readable_filenames(offline, pdfs):
     assert results["张三2020"].path == "papers/张三2020.pdf"
     assert results["李四2020"].path == "papers/李四2020.pdf"
     assert located_bytes(offline, "张三2020") == pdfs["x"]
-    manifest = json.loads(offline.manifest_path.read_text(encoding="utf-8"))
+    manifest = load_manifest(offline.manifest_path)
     assert manifest["张三2020"]["files"]["pdf"] == "papers/张三2020.pdf"
     assert reference_problems(offline) == []
 
@@ -379,7 +382,7 @@ def test_original_citation_key_is_preserved(offline, pdfs):
     payload = locate(offline, "smith:2020")
     assert payload["citation_key"] == "smith:2020"
     assert payload["files"]["pdf"]["path"] == "papers/smith_2020.pdf"
-    manifest = json.loads(offline.manifest_path.read_text(encoding="utf-8"))
+    manifest = load_manifest(offline.manifest_path)
     assert manifest["smith:2020"]["filename_stem"] == "smith_2020"
 
 

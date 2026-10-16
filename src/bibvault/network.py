@@ -6,11 +6,14 @@ import logging
 import socket
 import tempfile
 from collections import defaultdict
+from collections.abc import Iterable
 from pathlib import Path
 from urllib.parse import urlparse
 
+import httpcore
 import httpx
 
+from bibvault import __version__
 from bibvault.config import Settings
 from bibvault.errors import (
     AccessDeniedError,
@@ -27,7 +30,7 @@ from bibvault.pdfcheck import assert_pdf_file
 
 logger = logging.getLogger(__name__)
 
-USER_AGENT = "bibvault/0.1"
+USER_AGENT = f"bibvault/{__version__}"
 _BLOCKED_HOSTS = {"localhost", "localhost.localdomain"}
 
 
@@ -86,26 +89,113 @@ async def guard_request(request: httpx.Request) -> None:
 async def guard_url(url: str) -> None:
     """Reject non-HTTP and private-network targets before a request is made."""
 
+    try:
+        await _public_addresses(url)
+    except OSError:
+        return  # the connection attempt reports the DNS failure
+
+
+async def _public_addresses(url: str) -> list[str]:
     if not is_public_http_url(url):
         raise UnsafeURLError(f"refusing URL: {url}")
     parsed = urlparse(url)
     assert parsed.hostname is not None
-    host = parsed.hostname
+    return await _public_host_addresses(
+        parsed.hostname,
+        parsed.port or (443 if parsed.scheme == "https" else 80),
+    )
+
+
+async def _public_host_addresses(host: str, port: int) -> list[str]:
+    normalized = host.lower().rstrip(".")
+    if (
+        normalized in _BLOCKED_HOSTS
+        or normalized.endswith(".localhost")
+        or normalized.endswith(".local")
+    ):
+        raise UnsafeURLError(f"refusing host: {host}")
     try:
-        ipaddress.ip_address(host)
-        return
+        address = ipaddress.ip_address(normalized)
+        addresses = [host]
     except ValueError:
-        pass
-    try:
-        addresses = await _resolve(
-            host,
-            parsed.port or (443 if parsed.scheme == "https" else 80),
-        )
-    except OSError:
-        return  # the connection attempt reports the DNS failure
+        addresses = await _resolve(host, port)
+    else:
+        if not is_public_address(address):
+            raise UnsafeURLError(f"refusing local address {host}")
+    unique: list[str] = []
     for value in addresses:
         if not is_public_address(ipaddress.ip_address(value.split("%", 1)[0])):
             raise UnsafeURLError(f"refusing URL: {host} resolves to local address {value}")
+        if value not in unique:
+            unique.append(value)
+    return unique
+
+
+class _PinnedNetworkBackend(httpcore.AsyncNetworkBackend):
+    """Validate and pin DNS immediately before opening each TCP connection."""
+
+    def __init__(self) -> None:
+        self._backend = httpcore.AnyIOBackend()
+
+    async def connect_tcp(
+        self,
+        host: str,
+        port: int,
+        timeout: float | None = None,
+        local_address: str | None = None,
+        socket_options: Iterable[httpcore.SOCKET_OPTION] | None = None,
+    ) -> httpcore.AsyncNetworkStream:
+        try:
+            addresses = await _public_host_addresses(host, port)
+        except OSError as exc:
+            raise httpcore.ConnectError(f"DNS lookup failed for {host}: {exc}") from exc
+        if not addresses:
+            raise httpcore.ConnectError(f"DNS lookup returned no addresses for {host}")
+
+        last_error: Exception | None = None
+        for address in addresses:
+            try:
+                return await self._backend.connect_tcp(
+                    address,
+                    port,
+                    timeout=timeout,
+                    local_address=local_address,
+                    socket_options=socket_options,
+                )
+            except (httpcore.ConnectError, httpcore.ConnectTimeout) as exc:
+                last_error = exc
+        assert last_error is not None
+        raise last_error
+
+    async def connect_unix_socket(
+        self,
+        path: str,
+        timeout: float | None = None,
+        socket_options: Iterable[httpcore.SOCKET_OPTION] | None = None,
+    ) -> httpcore.AsyncNetworkStream:
+        raise UnsafeURLError(f"refusing Unix socket: {path}")
+
+    async def sleep(self, seconds: float) -> None:
+        await self._backend.sleep(seconds)
+
+
+class _PinnedTransport(httpx.AsyncBaseTransport):
+    """HTTPX transport whose connection pool uses the guarded DNS backend."""
+
+    def __init__(self) -> None:
+        self._transport = httpx.AsyncHTTPTransport()
+        # HTTPX has no public resolver hook. Fail closed if this compatibility
+        # point changes instead of silently losing connection-time validation.
+        pool = getattr(self._transport, "_pool", None)
+        if not isinstance(pool, httpcore.AsyncConnectionPool):
+            raise RuntimeError("unsupported HTTPX transport internals")
+        pool._network_backend = _PinnedNetworkBackend()
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        return await self._transport.handle_async_request(request)
+
+    async def aclose(self) -> None:
+        await self._transport.aclose()
 
 
 def make_client(settings: Settings) -> httpx.AsyncClient:
@@ -113,6 +203,7 @@ def make_client(settings: Settings) -> httpx.AsyncClient:
         timeout=httpx.Timeout(settings.download.timeout_seconds),
         follow_redirects=True,
         headers={"User-Agent": USER_AGENT},
+        transport=_PinnedTransport(),
         event_hooks={"request": [guard_request]},
     )
 

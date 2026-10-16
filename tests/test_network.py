@@ -4,9 +4,9 @@ import socket
 import httpx
 import pytest
 
-from bibvault import network
+from bibvault import __version__, network
 from bibvault.errors import UnsafeURLError
-from bibvault.network import HostLimiter, guard_request, is_public_http_url
+from bibvault.network import HostLimiter, guard_request, is_public_http_url, make_client
 
 REAL_RESOLVE = network._resolve
 
@@ -60,6 +60,69 @@ def test_resolution_failure_is_left_to_the_connection(monkeypatch):
 
     monkeypatch.setattr(network, "_resolve", fail)
     guard("https://no-such-host.example/paper.pdf")
+
+
+def test_connection_resolution_failure_fails_closed(monkeypatch):
+    async def fail(host, port):
+        raise socket.gaierror(socket.EAI_NONAME, "nodename nor servname provided")
+
+    monkeypatch.setattr(network, "_resolve", fail)
+    backend = network._PinnedNetworkBackend()
+    with pytest.raises(network.httpcore.ConnectError, match="DNS lookup failed"):
+        asyncio.run(backend.connect_tcp("no-such-host.example", 443))
+
+
+def test_rebinding_between_preflight_and_connection_is_refused(monkeypatch):
+    answers = iter([["93.184.216.34"], ["127.0.0.1"]])
+    connected = False
+
+    async def resolve(host, port):
+        return next(answers)
+
+    async def connect(*args, **kwargs):
+        nonlocal connected
+        connected = True
+        raise AssertionError("unsafe address reached the TCP backend")
+
+    monkeypatch.setattr(network, "_resolve", resolve)
+    monkeypatch.setattr(network.httpcore.AnyIOBackend, "connect_tcp", connect)
+
+    async def scenario():
+        await network.guard_url("https://rebind.example/paper.pdf")
+        backend = network._PinnedNetworkBackend()
+        await backend.connect_tcp("rebind.example", 443)
+
+    with pytest.raises(UnsafeURLError, match="resolves to local"):
+        asyncio.run(scenario())
+    assert not connected
+
+
+def test_connection_uses_the_validated_ip_not_the_hostname(monkeypatch):
+    connected: list[tuple[str, int]] = []
+    marker = object()
+
+    async def resolve(host, port):
+        return ["93.184.216.34"]
+
+    async def connect(self, host, port, **kwargs):
+        connected.append((host, port))
+        return marker
+
+    monkeypatch.setattr(network, "_resolve", resolve)
+    monkeypatch.setattr(network.httpcore.AnyIOBackend, "connect_tcp", connect)
+
+    backend = network._PinnedNetworkBackend()
+    stream = asyncio.run(backend.connect_tcp("rebind.example", 443))
+    assert stream is marker
+    assert connected == [("93.184.216.34", 443)]
+
+
+def test_user_agent_tracks_package_version(settings):
+    async def scenario():
+        async with make_client(settings) as client:
+            assert client.headers["user-agent"] == f"bibvault/{__version__}"
+
+    asyncio.run(scenario())
 
 
 @pytest.mark.parametrize(

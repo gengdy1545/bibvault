@@ -61,7 +61,18 @@ def test_module_entry_point():
 def test_help_lists_the_commands():
     result = CliRunner().invoke(app, ["--help"])
     assert result.exit_code == 0
-    for command in ("init", "fetch", "sync", "locate", "status", "verify", "import"):
+    for command in (
+        "init",
+        "doctor",
+        "fetch",
+        "sync",
+        "locate",
+        "status",
+        "find",
+        "sources",
+        "verify",
+        "import",
+    ):
         assert command in result.stdout
 
 
@@ -79,6 +90,56 @@ def test_init_creates_the_project_and_keeps_existing_config(project, monkeypatch
     assert second.exit_code == 0
     assert "already initialized" in second.stdout
     assert config_path.read_text(encoding="utf-8") == "[download]\nconcurrency = 1\n"
+
+
+def test_doctor_checks_local_readiness_without_creating_a_library(
+    project, monkeypatch, respx_mock
+):
+    config = write_config(project)
+    library = project / "papers"
+    library.mkdir()
+    browser = project / "chrome"
+    browser.write_text("", encoding="utf-8")
+    browser.chmod(0o755)
+    monkeypatch.setattr("bibvault.browser.find_browser", lambda _configured: str(browser))
+    monkeypatch.setenv("BIBVAULT_OPENALEX_API_KEY", "secret-test-key")
+
+    result = cli(config, "doctor")
+
+    assert result.exit_code == 0, result.output
+    assert f"OK   config: {config}" in result.stdout
+    assert f"OK   library: {library} is writable" in result.stdout
+    assert f"OK   browser: {browser}" in result.stdout
+    assert "OK   OpenAlex: API key configured via BIBVAULT_OPENALEX_API_KEY" in result.stdout
+    assert "secret-test-key" not in result.stdout
+    assert "doctor: ready" in result.stdout
+    assert list(library.iterdir()) == []
+    assert not (project / ".bibvault" / "index.sqlite").exists()
+    assert len(respx_mock.calls) == 0
+
+
+def test_doctor_treats_missing_optional_services_as_warnings(project):
+    config = write_config(project)
+    (project / "papers").mkdir()
+
+    result = cli(config, "doctor")
+
+    assert result.exit_code == 0, result.output
+    assert "WARN OpenAlex: no API key" in result.stdout
+    assert "WARN browser: no Chromium-family browser found" in result.stdout
+    assert "doctor: ready" in result.stdout
+
+
+def test_doctor_fails_when_the_library_path_is_not_a_directory(project):
+    config = write_config(project, '[library]\nroot = "./library-file"\n')
+    (project / "library-file").write_text("not a directory", encoding="utf-8")
+
+    result = cli(config, "doctor")
+
+    assert result.exit_code == 1
+    assert f"FAIL library: {project / 'library-file'}: not a directory" in result.stdout
+    assert "doctor: 1 required check(s) failed" in result.stdout
+    assert not (project / ".bibvault" / "index.sqlite").exists()
 
 
 def test_fetch_prints_a_report(fetched):
@@ -188,15 +249,23 @@ def test_locate_json(fetched, config):
     assert payload["files"]["pdf"]["path"] == "papers/paper.pdf"
 
 
-@pytest.mark.parametrize("key", ["other", "nobody"])
-def test_locate_without_a_pdf_exits_1(fetched, config, key):
-    text = cli(config, "locate", key)
-    assert text.exit_code == 1
-    assert f"{key}: not available" in text.stdout
-    as_json = cli(config, "locate", key, "--format", "json")
-    assert as_json.exit_code == 1
-    payload = json.loads(as_json.stdout)
-    assert payload is None or payload["files"] == {}
+def test_locate_distinguishes_a_missing_file_from_an_unknown_key(fetched, config):
+    missing = cli(config, "locate", "other")
+    assert missing.exit_code == 1
+    assert "other: not available" in missing.stdout
+    missing_json = json.loads(cli(config, "locate", "other", "--format", "json").stdout)
+    assert missing_json["availability"] == "missing"
+    assert missing_json["status"] == "not_found"
+    assert missing_json["error_category"] == "not_found"
+    assert missing_json["files"] == {}
+
+    unknown = cli(config, "locate", "nobody")
+    assert unknown.exit_code == 2
+    assert "nobody: unknown citation key" in unknown.stdout
+    unknown_json = json.loads(cli(config, "locate", "nobody", "--format", "json").stdout)
+    assert unknown_json["availability"] == "unknown"
+    assert unknown_json["status"] == "unknown"
+    assert unknown_json["error_category"] == "unknown_key"
 
 
 def test_locate_rejects_bad_format(config):
@@ -208,8 +277,11 @@ def test_status(fetched, config):
     assert text.exit_code == 0
     assert "paper: downloaded papers/paper.pdf" in text.stdout
     assert "other: not_found" in text.stdout
-    rows = json.loads(cli(config, "status", "--format", "json").stdout)
-    assert {row["citation_key"] for row in rows} == {"paper", "other"}
+    payload = json.loads(cli(config, "status", "--format", "json").stdout)
+    assert payload["schema_version"] == 1
+    assert payload["coverage"] is None
+    assert {row["citation_key"] for row in payload["references"]} == {"paper", "other"}
+    assert {row["availability"] for row in payload["references"]} == {"available", "missing"}
     assert cli(config, "status", "--format", "csv").exit_code == 2
 
 
@@ -241,7 +313,7 @@ def test_sync_follows_a_renamed_key(fetched, config, bib, respx_mock):
     assert "Already on disk:      1" in result.stdout
     assert len([c for c in respx_mock.calls[calls:] if c.request.url == PAPER_URL]) == 0
     assert cli(config, "verify", "--references").exit_code == 0
-    assert cli(config, "locate", "paper").exit_code == 1
+    assert cli(config, "locate", "paper").exit_code == 2
     assert cli(config, "locate", "paper2020").stdout.splitlines()[0] == "papers/paper2020.pdf"
 
 

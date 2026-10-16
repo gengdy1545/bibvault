@@ -5,7 +5,9 @@ import json
 import logging
 import os
 import re
+import shutil
 import sys
+import tempfile
 from enum import StrEnum
 from pathlib import Path
 
@@ -13,8 +15,10 @@ import httpx
 import typer
 
 from bibvault import __version__
+from bibvault import browser as browser_support
 from bibvault.config import (
     DEFAULT_CONFIG,
+    ConfigError,
     Settings,
     credentials_path,
     load_settings,
@@ -29,15 +33,25 @@ from bibvault.pipeline import (
     FetchDisplay,
     format_report,
     import_file,
-    lookup_reference,
-    run_fetch,
-    summarize,
 )
 from bibvault.resolve import (
     KEYLESS_DAILY_REQUESTS,
     check_openalex_key,
     keyless_requests_today,
     openalex_paused_until,
+)
+from bibvault.service import (
+    SCHEMA_VERSION,
+    acquire,
+    acquisition_document,
+    acquisition_exit,
+    apply_prune,
+    find_references,
+    list_sources,
+    locate_exit,
+    locate_reference,
+    plan_prune,
+    status_report,
 )
 from bibvault.storage import Library
 
@@ -66,7 +80,10 @@ def main(
 ) -> None:
     """Acquire open-access papers and map them from BibTeX citation keys."""
 
-    settings = load_settings(config_path=config)
+    try:
+        settings = load_settings(config_path=config)
+    except ConfigError as exc:
+        raise typer.BadParameter(str(exc), param_hint="--config") from exc
     ctx.obj = settings
     logging.basicConfig(
         level=getattr(logging, settings.logging_level.upper(), logging.INFO),
@@ -102,6 +119,66 @@ def init(ctx: typer.Context) -> None:
 
 
 @app.command()
+def doctor(ctx: typer.Context) -> None:
+    """Check local readiness without making network requests or downloads."""
+
+    settings: Settings = ctx.obj
+    failures = 0
+
+    version = sys.version_info
+    if version >= (3, 11):
+        typer.echo(f"OK   Python: {version.major}.{version.minor}.{version.micro}")
+    else:
+        failures += 1
+        typer.echo(
+            f"FAIL Python: {version.major}.{version.minor}.{version.micro}; Python 3.11+ is required"
+        )
+
+    if settings.config_path is None:
+        expected = settings.project_root / ".bibvault" / "config.toml"
+        typer.echo(
+            "INFO config: no project config found; using user-level configuration and defaults "
+            f"(expected {expected})"
+        )
+    else:
+        typer.echo(f"OK   config: {settings.config_path}")
+
+    write_error = _directory_write_error(settings.library_root)
+    if write_error is None:
+        typer.echo(f"OK   library: {settings.library_root} is writable")
+    else:
+        failures += 1
+        typer.echo(f"FAIL library: {settings.library_root}: {write_error}")
+
+    key = (settings.resolution.openalex_api_key or "").strip()
+    if not settings.resolution.use_openalex:
+        typer.echo("INFO OpenAlex: disabled by resolution.use_openalex")
+    elif key:
+        typer.echo(f"OK   OpenAlex: API key configured via {_openalex_key_source(settings, key)}")
+    else:
+        typer.echo(
+            "WARN OpenAlex: no API key; DOI lookups are limited and title search is unavailable"
+        )
+
+    configured_browser = settings.browser.executable
+    executable = browser_support.find_browser(configured_browser)
+    if executable and _browser_executable_exists(executable):
+        typer.echo(f"OK   browser: {executable}")
+    elif configured_browser:
+        typer.echo(f"WARN browser: configured executable was not found: {configured_browser}")
+    else:
+        typer.echo(
+            "WARN browser: no Chromium-family browser found; it is only needed for "
+            "`fetch --browser` publisher access"
+        )
+
+    if failures:
+        typer.echo(f"doctor: {failures} required check(s) failed")
+        raise typer.Exit(1)
+    typer.echo("doctor: ready")
+
+
+@app.command()
 def fetch(
     ctx: typer.Context,
     bib: list[Path] = typer.Argument(..., help="BibTeX files"),
@@ -114,10 +191,19 @@ def fetch(
         "--browser",
         help="Render dynamic web pages and open publisher links that require a browser",
     ),
+    upgrade: bool = typer.Option(
+        False,
+        "--upgrade",
+        help="Replace a stored PDF only when a higher-ranked version downloads",
+    ),
 ) -> None:
     """Resolve BibTeX entries and download open-access PDFs and web pages."""
 
-    _run_acquisition(ctx, bib, key, output_format, browser=browser)
+    if upgrade and not key:
+        raise typer.BadParameter("--upgrade requires --key")
+    if upgrade and browser:
+        raise typer.BadParameter("--upgrade cannot be combined with --browser")
+    _run_acquisition(ctx, bib, key, output_format, browser=browser, upgrade=upgrade)
 
 
 @app.command()
@@ -125,10 +211,44 @@ def sync(
     ctx: typer.Context,
     bib: list[Path] = typer.Argument(..., help="BibTeX files"),
     output_format: str = typer.Option("text", "--format", help="text or json"),
+    browser: bool = typer.Option(
+        False,
+        "--browser",
+        help="Render dynamic web pages and open publisher links that require a browser",
+    ),
+    prune_keys: bool = typer.Option(
+        False,
+        "--prune-keys",
+        help="Release citation keys absent from these BibTeX files; PDF bytes are moved, not deleted",
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="With --prune-keys, list leftover keys without changing the library or downloading",
+    ),
 ) -> None:
     """Reconcile citation-key renames, then download missing open-access PDFs."""
 
-    _run_acquisition(ctx, bib, None, output_format)
+    _require_format(output_format)
+    if dry_run and not prune_keys:
+        raise typer.BadParameter("--dry-run requires --prune-keys")
+    if not prune_keys:
+        _run_acquisition(ctx, bib, None, output_format, browser=browser)
+        return
+    references = _parsed_bib(bib)
+    settings: Settings = ctx.obj
+    library = _library(settings)
+    try:
+        if dry_run:
+            names = plan_prune(library, references)
+        else:
+            names = apply_prune(library, references)
+    finally:
+        library.close()
+    if dry_run:
+        _echo_prune_plan(names, output_format)
+        return
+    _run_acquisition(ctx, bib, None, output_format, browser=browser, pruned=names)
 
 
 @app.command()
@@ -139,69 +259,115 @@ def locate(
 ) -> None:
     """Resolve a citation key to local files and provenance."""
 
+    _require_format(output_format)
     settings: Settings = ctx.obj
     library = _library(settings)
     try:
-        payload = lookup_reference(library, citation_key)
+        payload = locate_reference(library, citation_key)
     finally:
         library.close()
-    if output_format not in {"text", "json"}:
-        raise typer.BadParameter("format must be text or json")
-    chosen = None if payload is None else _located_file(payload)
-    if payload is None or chosen is None:
-        if output_format == "json":
-            typer.echo(json.dumps(payload, indent=2, ensure_ascii=False))
-        else:
-            typer.echo(f"{citation_key}: not available")
-        raise typer.Exit(1)
     if output_format == "json":
-        typer.echo(json.dumps(payload, indent=2, ensure_ascii=False))
-        return
-    typer.echo(chosen["path"])
-    typer.echo(f"reference_id: {payload['reference_id']}")
-    typer.echo(f"status: {payload['status']}")
-    typer.echo(f"version: {payload['version']}")
-    typer.echo(f"sha256: {chosen['sha256']}")
-    typer.echo(f"source: {chosen['source_url']}")
-    typer.echo(f"provider: {chosen['provider']}")
+        _echo_json(payload)
+    elif payload["availability"] == "unknown":
+        typer.echo(f"{citation_key}: unknown citation key")
+    elif payload["availability"] != "available":
+        typer.echo(f"{citation_key}: not available")
+    else:
+        chosen = _located_file(payload)
+        typer.echo(payload["path"])
+        typer.echo(f"reference_id: {payload['reference_id']}")
+        typer.echo(f"status: {payload['status']}")
+        typer.echo(f"version: {payload['version']}")
+        typer.echo(f"sha256: {chosen['sha256']}")
+        typer.echo(f"source: {chosen['source_url']}")
+        typer.echo(f"provider: {chosen['provider']}")
+    code = locate_exit(payload)
+    if code:
+        raise typer.Exit(code)
 
 
-def _located_file(payload: dict) -> dict | None:
+def _located_file(payload: dict) -> dict:
     for role in ("pdf", "markdown"):
         record = payload["files"].get(role) or {}
         if record.get("path"):
             return record
-    return None
+    return {}
 
 
 @app.command()
 def status(
     ctx: typer.Context,
+    bib: list[Path] | None = typer.Argument(None, help="BibTeX files; when given, report coverage"),
     output_format: str = typer.Option("text", "--format", help="text or json"),
 ) -> None:
-    """Show the stored acquisition status of each citation key."""
+    """Show stored citation keys, or coverage against an optional BibTeX set."""
 
-    if output_format not in {"text", "json"}:
-        raise typer.BadParameter("format must be text or json")
+    _require_format(output_format)
+    references = _parsed_bib(bib) if bib else None
     settings: Settings = ctx.obj
     library = _library(settings)
     try:
-        rows = []
-        for key in library.all_keys():
-            found = lookup_reference(library, key.citation_key)
-            if found is not None:
-                rows.append(found)
+        report = status_report(library, references)
     finally:
         library.close()
     if output_format == "json":
-        typer.echo(json.dumps(rows, indent=2, ensure_ascii=False))
+        _echo_json(report)
         return
+    if references is not None:
+        _echo_coverage(report["coverage"])
+        return
+    rows = report["references"]
     if not rows:
         typer.echo("No references stored.")
         return
     for row in rows:
         pdf = row["files"].get("pdf", {}).get("path") or ""
         typer.echo(f"{row['citation_key']}: {row['status']} {pdf}".rstrip())
+
+
+@app.command()
+def find(
+    ctx: typer.Context,
+    doi: str | None = typer.Option(None, "--doi", help="Find a stored reference by DOI"),
+    title: str | None = typer.Option(None, "--title", help="Find stored references by title"),
+    output_format: str = typer.Option("text", "--format", help="text or json"),
+) -> None:
+    """Find citation keys already in the library. This command makes no network requests."""
+
+    _require_format(output_format)
+    if bool((doi or "").strip()) == bool((title or "").strip()):
+        raise typer.BadParameter("pass exactly one of doi or title")
+    settings: Settings = ctx.obj
+    library = _library(settings)
+    try:
+        matches = find_references(library, doi=doi, title=title)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    finally:
+        library.close()
+    if output_format == "json":
+        _echo_json({"schema_version": SCHEMA_VERSION, "matches": matches})
+    elif not matches:
+        typer.echo("no matching reference")
+    else:
+        for item in matches:
+            typer.echo(f"{item['citation_key']}: {item['path'] or ''}".rstrip())
+    if not matches:
+        raise typer.Exit(1)
+
+
+@app.command()
+def sources(output_format: str = typer.Option("text", "--format", help="text or json")) -> None:
+    """List supported database sources and whether they need a browser."""
+
+    _require_format(output_format)
+    described = list_sources()
+    if output_format == "json":
+        _echo_json({"schema_version": SCHEMA_VERSION, "sources": described})
+        return
+    for item in described:
+        hosts = ", ".join(item["hosts"])
+        typer.echo(f"{item['provider']}: {item['access']} ({hosts})")
 
 
 @app.command()
@@ -343,20 +509,12 @@ def _run_acquisition(
     output_format: str,
     *,
     browser: bool = False,
+    upgrade: bool = False,
+    pruned: list[str] | None = None,
 ) -> None:
-    if output_format not in {"text", "json"}:
-        raise typer.BadParameter("format must be text or json")
-    for path in bib:
-        if not path.is_file():
-            raise typer.BadParameter(f"BibTeX file not found: {path}")
+    _require_format(output_format)
+    references = _parsed_bib(bib)
     settings: Settings = ctx.obj
-    try:
-        references, warnings = parse_paths(bib)
-    except ParseError as exc:
-        typer.echo(exc.message, err=True)
-        raise typer.Exit(1) from exc
-    for warning in warnings:
-        typer.echo(f"warning: {warning}", err=True)
     library = _library(settings)
     live = output_format == "text"
     display = FetchDisplay()
@@ -390,12 +548,13 @@ def _run_acquisition(
 
     try:
         results = asyncio.run(
-            run_fetch(
+            acquire(
                 library,
                 references,
                 settings,
                 only_keys=key,
                 browser=browser,
+                upgrade=upgrade,
                 on_status=on_status if live else None,
                 on_progress=on_progress if live else None,
                 confirm=confirm if live and browser else None,
@@ -409,17 +568,68 @@ def _run_acquisition(
             log.setLevel(level)
         library.close()
     if output_format == "json":
-        typer.echo(
-            json.dumps(
-                {"summary": summarize(results), "results": [item.model_dump() for item in results]},
-                indent=2,
-                ensure_ascii=False,
-            )
-        )
+        _echo_json(acquisition_document(results, pruned=pruned))
     else:
+        if pruned:
+            typer.echo(
+                f"Released {len(pruned)} leftover citation key(s); PDF bytes were moved, not deleted."
+            )
         typer.echo(format_report(results))
-    if any(item.status == "failed" for item in results):
-        raise typer.Exit(1)
+    code = acquisition_exit(results)
+    if code:
+        raise typer.Exit(code)
+
+
+def _parsed_bib(bib: list[Path]) -> list[Reference]:
+    for path in bib:
+        if not path.is_file():
+            raise typer.BadParameter(f"BibTeX file not found: {path}")
+    try:
+        references, warnings = parse_paths(bib)
+    except ParseError as exc:
+        typer.echo(exc.message, err=True)
+        raise typer.Exit(1) from exc
+    for warning in warnings:
+        typer.echo(f"warning: {warning}", err=True)
+    return references
+
+
+def _require_format(output_format: str) -> None:
+    if output_format not in {"text", "json"}:
+        raise typer.BadParameter("format must be text or json")
+
+
+def _echo_json(payload: object) -> None:
+    typer.echo(json.dumps(payload, indent=2, ensure_ascii=False))
+
+
+def _echo_prune_plan(names: list[str], output_format: str) -> None:
+    if output_format == "json":
+        _echo_json({"schema_version": SCHEMA_VERSION, "dry_run": True, "pruned": names})
+        return
+    if not names:
+        typer.echo("No leftover citation keys.")
+        return
+    typer.echo(
+        f"Would release {len(names)} citation key(s). "
+        "PDF bytes would move to papers/_unreferenced/ and would not be deleted:"
+    )
+    for name in names:
+        typer.echo(f"  {name}")
+
+
+def _echo_coverage(coverage: dict) -> None:
+    labels = (
+        ("available_locally", "Available locally"),
+        ("known_missing_file", "Known, file missing"),
+        ("not_in_library", "Not in library"),
+        ("leftover", "Left in library"),
+    )
+    for name, label in labels:
+        keys = coverage["keys"][name]
+        typer.echo(f"{label}: {coverage[name]}")
+        for key in keys:
+            typer.echo(f"  {key}")
 
 
 def _reference_for_import(
@@ -455,3 +665,38 @@ def _library(settings: Settings) -> Library:
         settings.db_path,
         settings.manifest_path,
     )
+
+
+def _directory_write_error(path: Path) -> str | None:
+    if not path.exists():
+        return "directory does not exist; run `bibvault init`"
+    if not path.is_dir():
+        return "not a directory"
+
+    probe: Path | None = None
+    try:
+        descriptor, name = tempfile.mkstemp(prefix=".bibvault-doctor-", dir=path)
+        probe = Path(name)
+        os.close(descriptor)
+        probe.unlink()
+    except OSError as exc:
+        return exc.strerror or str(exc)
+    finally:
+        if probe is not None:
+            probe.unlink(missing_ok=True)
+    return None
+
+
+def _browser_executable_exists(executable: str) -> bool:
+    path = Path(executable)
+    return (path.is_file() and os.access(path, os.X_OK)) or shutil.which(executable) is not None
+
+
+def _openalex_key_source(settings: Settings, key: str) -> str:
+    if os.environ.get(_KEY_ENV):
+        return _KEY_ENV
+    if saved_openalex_key() == key:
+        return str(credentials_path())
+    if settings.config_path is not None:
+        return str(settings.config_path)
+    return "merged configuration"

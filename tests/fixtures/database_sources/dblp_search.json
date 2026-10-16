@@ -1,0 +1,38 @@
+{
+  "result": {
+    "query": "ALEX An Updatable Adaptive Learned Index",
+    "status": {
+      "@code": "200",
+      "text": "OK"
+    },
+    "hits": {
+      "@total": "1",
+      "hit": [
+        {
+          "@score": "8",
+          "info": {
+            "authors": {
+              "author": [
+                {
+                  "@pid": "123/456",
+                  "text": "Jialin Ding"
+                },
+                {
+                  "@pid": "78/90",
+                  "text": "Umar Farooq Minhas"
+                }
+              ]
+            },
+            "title": "ALEX: An Updatable Adaptive Learned Index.",
+            "venue": "SIGMOD Conference",
+            "year": "2020",
+            "doi": "10.1145/3318464.3389711",
+            "ee": "https://doi.org/10.1145/3318464.3389711",
+            "url": "https://dblp.org/rec/conf/sigmod/DingMYWDLZCGKLK20",
+            "key": "conf/sigmod/DingMYWDLZCGKLK20"
+          }
+        }
+      ]
+    }
+  }
+}

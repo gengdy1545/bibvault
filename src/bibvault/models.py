@@ -17,6 +17,7 @@ class Reference(BaseModel):
     publisher: str | None = None
     venue: str | None = None
     volume: str | None = None
+    number: str | None = None
     pages: str | None = None
     source: str | None = None
 
@@ -26,6 +27,7 @@ class Candidate(BaseModel):
     provider: str
     version: str
     source_rank: int
+    source_url: str | None = None
 
 
 class FileRecord(BaseModel):

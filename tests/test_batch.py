@@ -4,6 +4,7 @@ import json
 
 import pytest
 
+from bibvault.storage import load_manifest
 from tests.helpers import (
     PDF,
     SAMPLE_BIB,
@@ -159,7 +160,7 @@ def test_sample_bibliography_end_to_end(project, project_bib, remote, respx_mock
         project / "papers" / "delta-lake-paper.pdf"
     ).read_bytes()
 
-    manifest = json.loads((project / ".bibvault" / "manifest.json").read_text(encoding="utf-8"))
+    manifest = load_manifest(project / ".bibvault" / "manifest.json")
     assert set(manifest) == set(EXPECTED)
     assert manifest["lance-eprint"]["reference_id"] == manifest["lance-format-preprint"]["reference_id"]
     assert "bibvault import" in json.loads(cli(config, "locate", "lake-tables-short", "--format", "json").stdout)["error"]

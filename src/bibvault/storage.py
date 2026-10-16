@@ -16,12 +16,16 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from bibvault.errors import FileCollisionError
+from bibvault.identity import normalize_doi
 from bibvault.models import FileRecord, KeyRecord, Reference
 from bibvault.naming import disambiguated_stem, filename_for, sanitize_citation_key
 
 logger = logging.getLogger(__name__)
 
 UNREFERENCED_DIR = "_unreferenced"
+SCHEMA_VERSION = 2
+# Version 1 wraps the citation-key map. Omitted version is the legacy map itself.
+MANIFEST_VERSION = 1
 
 
 def sha256_file(path: Path) -> str:
@@ -40,6 +44,37 @@ def now_iso() -> str:
     return datetime.now(UTC).isoformat()
 
 
+class ManifestError(ValueError):
+    """A manifest file cannot be read under the supported contract."""
+
+
+def load_manifest(path: Path) -> dict[str, dict]:
+    """Return the citation-key map from a versioned or legacy manifest.
+
+    SQLite remains the source of truth. Version 1 stores that map under
+    ``references``. A file with no integer ``manifest_version`` is the legacy
+    map written before the version field existed. A newer version fails closed
+    instead of being mistaken for citation keys.
+    """
+
+    document = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(document, dict):
+        raise ManifestError("manifest must be a JSON object")
+    version = document.get("manifest_version")
+    if not isinstance(version, int):
+        return document
+    if version != MANIFEST_VERSION:
+        raise ManifestError(
+            f"manifest version {version} is not supported "
+            f"(this BibVault writes version {MANIFEST_VERSION}); "
+            "SQLite remains the source of truth"
+        )
+    references = document.get("references")
+    if not isinstance(references, dict):
+        raise ManifestError("manifest version 1 requires a references object")
+    return references
+
+
 class Library:
     def __init__(self, project_root: Path, library_root: Path, db_path: Path, manifest_path: Path) -> None:
         self.project_root = project_root
@@ -54,12 +89,32 @@ class Library:
         self.conn.execute("PRAGMA foreign_keys = ON")
         self.conn.execute("PRAGMA journal_mode = WAL")
         self._migrate()
+        # casefold(stem) -> reference_id -> row count. Built on first conflict check.
+        self._stem_counts: dict[str, dict[str, int]] | None = None
 
     def close(self) -> None:
         self.conn.close()
 
     def _migrate(self) -> None:
-        self.conn.executescript(
+        current = int(self.conn.execute("PRAGMA user_version").fetchone()[0])
+        if current > SCHEMA_VERSION:
+            raise RuntimeError(
+                f"database schema version {current} is newer than supported version {SCHEMA_VERSION}"
+            )
+        migrations = (self._migrate_v1, self._migrate_v2)
+        for target in range(current + 1, SCHEMA_VERSION + 1):
+            self.conn.execute("BEGIN")
+            try:
+                migrations[target - 1]()
+                self.conn.execute(f"PRAGMA user_version = {target}")
+            except BaseException:
+                self.conn.rollback()
+                raise
+            else:
+                self.conn.commit()
+
+    def _migrate_v1(self) -> None:
+        statements = (
             """
             CREATE TABLE IF NOT EXISTS publications (
                 reference_id TEXT PRIMARY KEY,
@@ -69,7 +124,9 @@ class Library:
                 arxiv_id TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
-            );
+            )
+            """,
+            """
             CREATE TABLE IF NOT EXISTS citation_keys (
                 citation_key TEXT PRIMARY KEY,
                 reference_id TEXT NOT NULL,
@@ -81,7 +138,9 @@ class Library:
                 error_detail TEXT,
                 updated_at TEXT NOT NULL,
                 FOREIGN KEY (reference_id) REFERENCES publications(reference_id)
-            );
+            )
+            """,
+            """
             CREATE TABLE IF NOT EXISTS files (
                 reference_id TEXT NOT NULL,
                 role TEXT NOT NULL,
@@ -94,17 +153,26 @@ class Library:
                 retrieved_at TEXT NOT NULL,
                 PRIMARY KEY (reference_id, role),
                 FOREIGN KEY (reference_id) REFERENCES publications(reference_id)
-            );
+            )
+            """,
+            """
             CREATE TABLE IF NOT EXISTS resolution_cache (
                 cache_key TEXT PRIMARY KEY,
                 payload TEXT NOT NULL,
                 fetched_at TEXT NOT NULL
-            );
+            )
+            """,
+        )
+        for statement in statements:
+            self.conn.execute(statement)
+
+    def _migrate_v2(self) -> None:
+        self.conn.execute(
+            """
             CREATE INDEX IF NOT EXISTS idx_citation_reference
-                ON citation_keys(reference_id);
+                ON citation_keys(reference_id)
             """
         )
-        self.conn.commit()
 
     def upsert_publication(self, reference: Reference, reference_id: str) -> None:
         timestamp = now_iso()
@@ -137,6 +205,94 @@ class Library:
             (reference_id,),
         ).fetchone()
 
+    def migrate_legacy_internal_identity(
+        self,
+        old_reference_id: str,
+        new_reference_id: str,
+        reference: Reference,
+    ) -> bool:
+        """Rebind a legacy internal id without moving bytes or rewriting provenance."""
+
+        if old_reference_id == new_reference_id:
+            return True
+        if not old_reference_id.startswith("internal:") or not new_reference_id.startswith("internal:"):
+            raise ValueError("internal identity migration requires internal ids")
+        old = self.get_publication(old_reference_id)
+        if old is None:
+            return False
+        conflict = self.conn.execute(
+            """
+            SELECT 1
+            FROM files AS old
+            JOIN files AS target ON target.role = old.role
+            WHERE old.reference_id = ? AND target.reference_id = ?
+            LIMIT 1
+            """,
+            (old_reference_id, new_reference_id),
+        ).fetchone()
+        if conflict is not None:
+            logger.warning(
+                "left legacy identity %s unchanged because %s already has stored provenance",
+                old_reference_id,
+                new_reference_id,
+            )
+            return False
+
+        timestamp = now_iso()
+        moved_stems = self._citation_stems(old_reference_id) if self._stem_counts is not None else []
+        title = reference.title if reference.title is not None else old["title"]
+        year = reference.year if reference.year is not None else old["year"]
+        doi = reference.doi if reference.doi is not None else old["doi"]
+        arxiv_id = reference.arxiv_id if reference.arxiv_id is not None else old["arxiv_id"]
+        self.conn.execute("BEGIN")
+        try:
+            target = self.get_publication(new_reference_id)
+            if target is None:
+                self.conn.execute(
+                    """
+                    INSERT INTO publications (
+                        reference_id, title, year, doi, arxiv_id, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        new_reference_id,
+                        title,
+                        year,
+                        doi,
+                        arxiv_id,
+                        old["created_at"],
+                        timestamp,
+                    ),
+                )
+            else:
+                self.conn.execute(
+                    """
+                    UPDATE publications
+                    SET title = ?, year = ?, doi = ?, arxiv_id = ?, updated_at = ?
+                    WHERE reference_id = ?
+                    """,
+                    (title, year, doi, arxiv_id, timestamp, new_reference_id),
+                )
+            self.conn.execute(
+                "UPDATE files SET reference_id = ? WHERE reference_id = ?",
+                (new_reference_id, old_reference_id),
+            )
+            self.conn.execute(
+                "UPDATE citation_keys SET reference_id = ? WHERE reference_id = ?",
+                (new_reference_id, old_reference_id),
+            )
+            self.conn.execute(
+                "DELETE FROM publications WHERE reference_id = ?",
+                (old_reference_id,),
+            )
+        except BaseException:
+            self.conn.rollback()
+            raise
+        else:
+            self.conn.commit()
+            self._move_stem_counts(moved_stems, old_reference_id, new_reference_id)
+        return True
+
     def allocate_stem(
         self,
         citation_key: str,
@@ -158,10 +314,9 @@ class Library:
         return base
 
     def _stem_conflicts(self, stem: str, reference_id: str, accept_sha256: str | None) -> bool:
-        rows = self.conn.execute("SELECT filename_stem, reference_id FROM citation_keys")
-        for row in rows:
-            if row["filename_stem"].casefold() == stem.casefold() and row["reference_id"] != reference_id:
-                return True
+        owners = self._stem_index().get(stem.casefold(), {})
+        if any(owner != reference_id for owner in owners):
+            return True
         allowed: set[str] | None = None
         for role in ("pdf", "markdown"):
             path = self.library_root / filename_for(stem, role)
@@ -177,7 +332,48 @@ class Library:
                 return True
         return False
 
+    def _stem_index(self) -> dict[str, dict[str, int]]:
+        if self._stem_counts is None:
+            counts: dict[str, dict[str, int]] = {}
+            rows = self.conn.execute("SELECT filename_stem, reference_id FROM citation_keys")
+            for row in rows:
+                _bump_stem(counts, str(row["filename_stem"]), str(row["reference_id"]), 1)
+            self._stem_counts = counts
+        return self._stem_counts
+
+    def _citation_stems(self, reference_id: str, stem: str | None = None) -> list[str]:
+        if stem is None:
+            rows = self.conn.execute(
+                "SELECT filename_stem FROM citation_keys WHERE reference_id = ?",
+                (reference_id,),
+            )
+        else:
+            rows = self.conn.execute(
+                "SELECT filename_stem FROM citation_keys WHERE reference_id = ? AND filename_stem = ?",
+                (reference_id, stem),
+            )
+        return [str(row["filename_stem"]) for row in rows]
+
+    def _move_stem_counts(
+        self,
+        stems: list[str],
+        old_reference_id: str,
+        new_reference_id: str,
+        new_stem: str | None = None,
+    ) -> None:
+        if self._stem_counts is None:
+            return
+        for stem in stems:
+            _bump_stem(self._stem_counts, stem, old_reference_id, -1)
+            _bump_stem(
+                self._stem_counts,
+                stem if new_stem is None else new_stem,
+                new_reference_id,
+                1,
+            )
+
     def upsert_key(self, reference: Reference, reference_id: str, stem: str, status: str) -> None:
+        previous = self.get_key(reference.citation_key) if self._stem_counts is not None else None
         self.conn.execute(
             """
             INSERT INTO citation_keys (
@@ -205,6 +401,10 @@ class Library:
             ),
         )
         self.conn.commit()
+        if self._stem_counts is not None:
+            if previous is not None:
+                _bump_stem(self._stem_counts, previous.filename_stem, previous.reference_id, -1)
+            _bump_stem(self._stem_counts, stem, reference_id, 1)
 
     def set_status(
         self,
@@ -243,8 +443,11 @@ class Library:
         return [_key(row) for row in rows]
 
     def delete_key(self, citation_key: str) -> None:
+        previous = self.get_key(citation_key) if self._stem_counts is not None else None
         self.conn.execute("DELETE FROM citation_keys WHERE citation_key = ?", (citation_key,))
         self.conn.commit()
+        if previous is not None and self._stem_counts is not None:
+            _bump_stem(self._stem_counts, previous.filename_stem, previous.reference_id, -1)
 
     def files_for(self, reference_id: str) -> list[FileRecord]:
         rows = self.conn.execute(
@@ -259,6 +462,37 @@ class Library:
             (reference_id, role),
         ).fetchone()
         return _file(row) if row else None
+
+    def search_keys(self, *, doi: str | None = None, title: str | None = None) -> list[KeyRecord]:
+        """Return citation keys matching a stored DOI or title. This does not use the network."""
+
+        wanted_doi = normalize_doi(doi) if doi else None
+        needle = " ".join((title or "").casefold().split())
+        rows = self.conn.execute(
+            """
+            SELECT
+                citation_keys.*,
+                publications.doi AS publication_doi,
+                publications.title AS publication_title
+            FROM citation_keys
+            JOIN publications ON publications.reference_id = citation_keys.reference_id
+            ORDER BY citation_keys.citation_key
+            """
+        )
+        matched: list[KeyRecord] = []
+        for row in rows:
+            if wanted_doi is not None:
+                stored = normalize_doi(row["publication_doi"])
+                if stored != wanted_doi and row["reference_id"] != f"doi:{wanted_doi}":
+                    continue
+            if needle:
+                haystack = " ".join(
+                    str(row["publication_title"] or row["title"] or "").casefold().split()
+                )
+                if needle not in haystack:
+                    continue
+            matched.append(_key(row))
+        return matched
 
     def cache_get(self, cache_key: str) -> str | None:
         row = self.conn.execute(
@@ -339,6 +573,80 @@ class Library:
             provider=provider,
         )
         return destination
+
+    def replace_download(
+        self,
+        *,
+        reference_id: str,
+        stem: str,
+        role: str,
+        version: str,
+        partial: Path,
+        source_url: str | None,
+        provider: str,
+        destination: Path | None = None,
+        previous_sha256: str | None = None,
+    ) -> Path:
+        """Atomically replace a stored file with a validated partial, restoring it if the record fails."""
+
+        target = destination or self.path_for(stem, role)
+        digest = sha256_file(partial)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        backup: Path | None = None
+        if target.exists():
+            backup = target.with_name(target.name + ".replaced")
+            backup.unlink(missing_ok=True)
+            try:
+                os.link(target, backup)
+            except OSError:
+                shutil.copy2(target, backup)
+        try:
+            os.replace(partial, target)
+            self._upsert_file(
+                reference_id=reference_id,
+                role=role,
+                version=version,
+                path=target,
+                digest=digest,
+                source_url=source_url,
+                provider=provider,
+            )
+        except Exception:
+            if backup is not None and backup.is_file():
+                os.replace(backup, target)
+            partial.unlink(missing_ok=True)
+            raise
+        if backup is not None:
+            backup.unlink(missing_ok=True)
+        self._refresh_role_aliases(reference_id, role, previous_sha256, digest)
+        return target
+
+    def _refresh_role_aliases(
+        self,
+        reference_id: str,
+        role: str,
+        previous_sha256: str | None,
+        new_sha256: str,
+    ) -> None:
+        record = self.get_file(reference_id, role)
+        if record is None:
+            return
+        source = self.absolute(record)
+        if not source.is_file():
+            return
+        for key in self.keys_for(reference_id):
+            alias = self.path_for(key.filename_stem, role)
+            if alias.resolve() == source.resolve():
+                continue
+            if alias.exists():
+                digest = sha256_file(alias)
+                if digest == new_sha256:
+                    continue
+                if previous_sha256 is not None and digest != previous_sha256:
+                    logger.warning("left %s in place: it does not hold the replaced bytes", alias.name)
+                    continue
+                alias.unlink()
+            _link_or_copy(source, alias)
 
     def commit_bytes(
         self,
@@ -481,6 +789,7 @@ class Library:
     def rename_files(self, reference_id: str, old_stem: str, new_stem: str) -> None:
         if old_stem == new_stem:
             return
+        moved = self._citation_stems(reference_id, old_stem) if self._stem_counts is not None else []
         for record in self.files_for(reference_id):
             source = self.path_for(old_stem, record.role)
             if not source.is_file():
@@ -504,6 +813,7 @@ class Library:
             (new_stem, now_iso(), reference_id, old_stem),
         )
         self.conn.commit()
+        self._move_stem_counts(moved, reference_id, reference_id, new_stem)
 
     def prune_missing(self, reference_id: str) -> None:
         """Forget stored files that were deleted, unless another key still has the bytes."""
@@ -547,12 +857,16 @@ class Library:
         return self.preferred_file(reference_id) is not None
 
     def export_manifest(self) -> None:
-        document: dict[str, dict] = {}
+        files_by_reference: dict[str, list[FileRecord]] = {}
+        for row in self.conn.execute("SELECT * FROM files ORDER BY reference_id, role"):
+            record = _file(row)
+            files_by_reference.setdefault(record.reference_id, []).append(record)
+        references: dict[str, dict] = {}
         for key in self.all_keys():
             files: dict[str, str | None] = {}
             provenance: dict[str, dict] = {}
             preferred_version = None
-            for record in self.files_for(key.reference_id):
+            for record in files_by_reference.get(key.reference_id, ()):
                 located = self.resolve_file(key.filename_stem, record)
                 files[record.role] = None if located is None else self.relative(located)
                 provenance[record.role] = {
@@ -566,7 +880,7 @@ class Library:
                     preferred_version = record.version
                 elif record.role == "markdown" and preferred_version is None:
                     preferred_version = record.version
-            document[key.citation_key] = {
+            references[key.citation_key] = {
                 "reference_id": key.reference_id,
                 "citation_key": key.citation_key,
                 "type": key.entry_type,
@@ -576,6 +890,7 @@ class Library:
                 "status": key.status,
                 "provenance": provenance,
             }
+        document = {"manifest_version": MANIFEST_VERSION, "references": references}
         self.manifest_path.parent.mkdir(parents=True, exist_ok=True)
         temporary = self.manifest_path.with_suffix(".json.partial")
         temporary.write_text(json.dumps(document, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
@@ -611,6 +926,20 @@ class Library:
                 if sha256_file(alias) != record.sha256:
                     problems.append(f"{key.citation_key}: checksum mismatch for {alias.name}")
         return problems
+
+
+def _bump_stem(counts: dict[str, dict[str, int]], stem: str, reference_id: str, delta: int) -> None:
+    folded = stem.casefold()
+    bucket = counts.get(folded) if delta < 0 else counts.setdefault(folded, {})
+    if bucket is None:
+        return
+    updated = bucket.get(reference_id, 0) + delta
+    if updated <= 0:
+        bucket.pop(reference_id, None)
+        if not bucket:
+            counts.pop(folded, None)
+        return
+    bucket[reference_id] = updated
 
 
 def _link_or_copy(source: Path, destination: Path) -> None:

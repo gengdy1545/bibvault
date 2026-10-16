@@ -1,0 +1,37 @@
+[
+  {
+    "case": "SIGMOD 2020",
+    "title": "ALEX: An Updatable Adaptive Learned Index",
+    "year": "2020",
+    "venue": "ACM SIGMOD International Conference on Management of Data",
+    "doi": "10.1145/3318464.3389711"
+  },
+  {
+    "case": "PACMMOD SIGMOD 2025",
+    "title": "PACMMOD V3, N3 (SIGMOD), June 2025: Editorial",
+    "year": "2025",
+    "venue": "Proceedings of the ACM on Management of Data",
+    "doi": "10.1145/3725255"
+  },
+  {
+    "case": "PACMMOD SIGMOD 2026",
+    "title": "100x Cost and Latency Reduction",
+    "year": "2026",
+    "venue": "Proceedings of the ACM on Management of Data",
+    "doi": "10.1145/3802002"
+  },
+  {
+    "case": "PACMMOD PODS 2025",
+    "title": "PACMMOD, V3, N2 (PODS), May 2025 Editorial",
+    "year": "2025",
+    "venue": "Proceedings of the ACM on Management of Data",
+    "doi": "10.1145/3725224"
+  },
+  {
+    "case": "SIGMOD Companion 2025",
+    "title": "Fifty Years of Transaction Processing Research",
+    "year": "2025",
+    "venue": "Companion of the 2025 International Conference on Management of Data",
+    "doi": "10.1145/3722212.3727992"
+  }
+]
